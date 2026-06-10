@@ -1750,6 +1750,14 @@ func runSync(cfg *config.Config, liveWP, stageWP *wpconfig.WPConfig, p *tea.Prog
 	defer stageDB.Close()
 	log.StepDone("Connected")
 
+	if err := guardrail.ValidateConnectedDBs(liveDB, stageDB); err != nil {
+		return err
+	}
+
+	// Capture the real site hosts before import wipes the stage database.
+	liveHost := sync.SiteHost(liveDB, liveWP.TablePrefix, discovery.ExtractDomain(cfg.LivePath))
+	stageHost := sync.SiteHost(stageDB, stageWP.TablePrefix, discovery.ExtractDomain(cfg.StagePath))
+
 	log.Step("Exporting from live database")
 	exp, err := export.Run(liveDB, liveWP.TablePrefix, cfg, log)
 	if err != nil {
@@ -1778,9 +1786,7 @@ func runSync(cfg *config.Config, liveWP, stageWP *wpconfig.WPConfig, p *tea.Prog
 	log.StepDone("File sync complete")
 
 	log.Step("Post-processing")
-	domain := discovery.ExtractDomain(cfg.LivePath)
-	stageDomain := discovery.ExtractDomain(cfg.StagePath)
-	if err := sync.PostProcess(cfg.StagePath, domain, stageDomain, log); err != nil {
+	if err := sync.PostProcess(cfg.StagePath, liveHost, stageHost, log); err != nil {
 		return fmt.Errorf("post-processing: %w", err)
 	}
 	log.StepDone("Post-processing complete")

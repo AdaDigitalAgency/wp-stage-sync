@@ -24,8 +24,11 @@ func Update(currentVersion string) error {
 		return fmt.Errorf("creating GitHub source: %w", err)
 	}
 
+	// Verify the downloaded binary against the release checksums.txt before it
+	// replaces the running executable.
 	updater, err := selfupdate.NewUpdater(selfupdate.Config{
-		Source: source,
+		Source:    source,
+		Validator: &selfupdate.ChecksumValidator{UniqueFilename: "checksums.txt"},
 	})
 	if err != nil {
 		return fmt.Errorf("creating updater: %w", err)

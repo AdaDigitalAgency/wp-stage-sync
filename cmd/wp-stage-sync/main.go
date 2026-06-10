@@ -284,6 +284,14 @@ func runUnattended(siteDomain string) error {
 	defer stageDB.Close()
 	log.StepDone("Connected")
 
+	if err := guardrail.ValidateConnectedDBs(liveDB, stageDB); err != nil {
+		return err
+	}
+
+	// Capture the real site hosts before import wipes the stage database.
+	liveHost := sync.SiteHost(liveDB, liveWP.TablePrefix, discovery.ExtractDomain(cfg.LivePath))
+	stageHost := sync.SiteHost(stageDB, stageWP.TablePrefix, discovery.ExtractDomain(cfg.StagePath))
+
 	// Step 0: Export
 	log.Step("Exporting from live database")
 	exp, err := export.Run(liveDB, liveWP.TablePrefix, cfg, log)
@@ -321,9 +329,7 @@ func runUnattended(siteDomain string) error {
 
 	// Step 3: Post-processing
 	log.Step("Post-processing")
-	domain := discovery.ExtractDomain(cfg.LivePath)
-	stageDomain := discovery.ExtractDomain(cfg.StagePath)
-	if err := sync.PostProcess(cfg.StagePath, domain, stageDomain, log); err != nil {
+	if err := sync.PostProcess(cfg.StagePath, liveHost, stageHost, log); err != nil {
 		return fmt.Errorf("post-processing: %w", err)
 	}
 	log.StepDone("Post-processing complete")
@@ -378,6 +384,10 @@ func runDryRun(siteDomain string) error {
 	defer stageDB.Close()
 	log.StepDone("Connected")
 
+	if err := guardrail.ValidateConnectedDBs(liveDB, stageDB); err != nil {
+		return err
+	}
+
 	// Plan the export (read-only — counts rows, dumps nothing).
 	log.Step("Planning export from live database")
 	plan, err := export.BuildPlan(liveDB, liveWP.TablePrefix, cfg, log)
@@ -404,7 +414,9 @@ func runDryRun(siteDomain string) error {
 	}
 	log.StepDone("File sync planned")
 
-	ppPlan := sync.PostProcessPlan(cfg.StagePath, liveDomain, stageDomain)
+	liveHost := sync.SiteHost(liveDB, liveWP.TablePrefix, liveDomain)
+	stageHost := sync.SiteHost(stageDB, stageWP.TablePrefix, stageDomain)
+	ppPlan := sync.PostProcessPlan(cfg.StagePath, liveHost, stageHost)
 
 	printExportPlan(plan)
 	printImportPlan(stageTables, plan)
@@ -420,8 +432,13 @@ func runDryRun(siteDomain string) error {
 func printExportPlan(p *export.Plan) {
 	fmt.Println()
 	fmt.Println("── Database export (from live) ───────────────────────────────")
-	fmt.Printf("Target orders:  %d (%s %d)\n", p.TargetOrders, p.OrderPreference, p.OrderCount)
-	fmt.Printf("Safe users:     %d\n", p.SafeUsers)
+	if p.WooCommerce {
+		fmt.Println("WooCommerce:    detected — order/user filtering applied")
+		fmt.Printf("Target orders:  %d (%s %d)\n", p.TargetOrders, p.OrderPreference, p.OrderCount)
+		fmt.Printf("Safe users:     %d\n", p.SafeUsers)
+	} else {
+		fmt.Println("WooCommerce:    not detected — full export (no order/user filtering)")
+	}
 	fmt.Printf("Tables in live: %d\n", p.TotalTables)
 
 	var filtered, full, schemaOnly, ignored []export.TablePlan
@@ -476,7 +493,8 @@ func printAnonymizePlan(anonymize bool) {
 	fmt.Println()
 	fmt.Println("── Anonymization ─────────────────────────────────────────────")
 	if anonymize {
-		fmt.Println("Enabled — customer users, usermeta, and order addresses would be masked after import.")
+		fmt.Println("Enabled — users, usermeta, order addresses, order records (email/IP/notes),")
+		fmt.Println("and order notes would be masked after import.")
 	} else {
 		fmt.Println("Disabled — customer data would be imported as-is.")
 	}

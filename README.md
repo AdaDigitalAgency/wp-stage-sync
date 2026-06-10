@@ -1,6 +1,6 @@
 # WP Stage Sync
 
-A TUI (Terminal User Interface) tool to synchronize WordPress sites between live and staging environments. Pull live to staging with smart WooCommerce order filtering and customer anonymization, or promote specific themes/plugins from staging to live with automated backup and atomic restore.
+A TUI (Terminal User Interface) tool to synchronize WordPress sites between live and staging environments. Pull live to staging with smart WooCommerce order filtering and customer anonymization, or promote specific themes/plugins from staging to live with automated backup and automatic restore.
 
 ![WP Stage Sync — Welcome screen and directory selector](website/images/screenshot-01.png)
 
@@ -15,13 +15,13 @@ A TUI (Terminal User Interface) tool to synchronize WordPress sites between live
 - **Full WordPress Sync**: Works seamlessly with clean, non-WooCommerce WordPress instances as a fast, full sync tool.
 - **File Sync**: Syncs `wp-content/` via rsync with customizable folder exclusion.
 - **Domain Mapping**: Runs search-replace for domain URLs and handles Elementor / Jetpack URL settings automatically.
-- **Production Guardrails**: **Never writes to production** — read-only access to the live database, all mutations target staging only.
+- **Production Guardrails**: In this mode the tool **never writes to production** — read-only access to the live database, all changes target staging only.
 
 ### Staging → Live (promote mode)
 
 - **Surgical Promote**: Select specific themes, plugins, and mu-plugins to promote from staging to live.
 - **Automated Backup**: Creates a tar.gz backup of live assets before any changes, with configurable retention.
-- **Atomic Restore**: Automatically restores from backup if any rsync operation fails mid-promote.
+- **Automatic Restore**: Automatically restores from backup if any rsync operation fails mid-promote.
 - **Restore Mode**: Browse and restore any previous backup from the TUI.
 
 ## Requirements
@@ -191,10 +191,13 @@ wp cache flush --allow-root
 
 The tool has built-in production guardrails:
 
-- **Read-only on production** — the live database connection only runs `SELECT` and `SHOW` queries. Zero `INSERT`, `UPDATE`, `DELETE`, or `DROP` statements touch production.
-- **Path validation** — aborts if live and stage paths resolve to the same directory
-- **Database validation** — aborts if live and stage point to the same database name + host
-- **Staging-only mutations** — all `DROP TABLE`, `INSERT INTO`, rsync `--delete`, `chown`, and WP-CLI commands target the staging environment exclusively
+- **Production database is never modified** — in both modes the live database connection only runs `SELECT` and `SHOW` queries. Zero `INSERT`, `UPDATE`, `DELETE`, or `DROP` statements touch the production database.
+- **Live → Staging writes only to staging** — in the default sync, all `DROP TABLE`, `INSERT INTO`, rsync `--delete`, `chown`, and WP-CLI commands target the staging environment exclusively. Production is never written.
+- **Promote writes production files, by design** — promote mode rsyncs the specific themes, plugins, and mu-plugins you select onto the live filesystem. It always takes a full backup first and automatically restores on failure — and it still never changes the production database.
+- **Path validation** — aborts if live and stage paths resolve to the same directory (symlinks resolved).
+- **Database validation** — aborts if live and stage resolve to the same database, compared by the connected server's identity rather than just the configured host string.
+
+> **Anonymization scope:** masking covers standard WooCommerce/WordPress customer fields (users, usermeta, HPOS order records and addresses, order notes). It does **not** guarantee that every plugin's stored PII or secret (API keys, payment/SMTP credentials, custom tables) is scrubbed. Treat staging as sensitive and secure it accordingly.
 
 ## Screenshots
 

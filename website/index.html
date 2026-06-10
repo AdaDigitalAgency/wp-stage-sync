@@ -6,7 +6,7 @@
 	<meta name="viewport" content="width=device-width, initial-scale=1.0">
 	<title>wp-stage-sync — WordPress Staging Sync & Promote</title>
 	<meta name="description"
-		content="Sync live WordPress to staging with smart WooCommerce filtering and anonymization, or promote themes and plugins from staging to live with automated backup and atomic restore.">
+		content="Sync live WordPress to staging with smart WooCommerce filtering and anonymization, or promote themes and plugins from staging to live with automated backup and automatic restore.">
 	<meta property="og:title" content="wp-stage-sync">
 	<meta property="og:description"
 		content="Sync live WordPress to staging. WooCommerce-aware, HPOS-compatible, production-safe.">
@@ -253,6 +253,7 @@
 			max-width: 600px;
 			margin: -16px auto 36px;
 			text-align: left;
+			scroll-margin-top: 75px;
 		}
 
 		.trust-note-text {
@@ -1136,7 +1137,8 @@
 			</div>
 			<h1>Live-to-staging sync,<br><span>as easy as it should be.</span></h1>
 			<p class="hero-sub">Sync live WordPress to staging with smart WooCommerce filtering and anonymization.
-				Promote specific themes and plugins from staging to live with automated backup and atomic restore.</p>
+				Promote specific themes and plugins from staging to live with automated backup and automatic restore.
+			</p>
 			<div class="install-block">
 				<span class="install-label">$ bash</span>
 				<span class="install-cmd" id="heroCmd">curl -sSL https://ada.tools/wp-stage-sync/install.sh |
@@ -1148,7 +1150,7 @@
 					</svg>
 				</button>
 			</div>
-			<div class="trust-note">
+			<div class="trust-note" id="disclaimer">
 				<p class="trust-note-text">
 					<strong>Hey stranger.</strong> Don't trust anyone, and don't run random commands from the internet.
 					Want to see what's inside the install script first?
@@ -1273,6 +1275,19 @@
 					<div class="feature-icon">
 						<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
 							stroke-linecap="round">
+							<ellipse cx="12" cy="5" rx="9" ry="3" />
+							<path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3" />
+							<path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5" />
+						</svg>
+					</div>
+					<h3>Full WordPress Sync</h3>
+					<p>No WooCommerce? It just works. Plain WordPress sites get a fast, complete copy of every
+						table — no order filtering, nothing dropped.</p>
+				</div>
+				<div class="feature-card">
+					<div class="feature-icon">
+						<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+							stroke-linecap="round">
 							<path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2" />
 							<circle cx="9" cy="7" r="4" />
 							<path d="M23 21v-2a4 4 0 00-3-3.87" />
@@ -1281,7 +1296,8 @@
 					</div>
 					<h3>Customer Anonymization</h3>
 					<p>Optionally masks billing and shipping addresses, names, emails, and phone numbers in the staging
-						database. Admin and editor accounts are always preserved intact.</p>
+						database. Admin and editor accounts stay intact. Covers standard WooCommerce/WordPress fields —
+						not a guarantee every plugin's PII is scrubbed.</p>
 				</div>
 				<div class="feature-card">
 					<div class="feature-icon">
@@ -1321,8 +1337,9 @@
 						</svg>
 					</div>
 					<h3>Production Guardrails</h3>
-					<p>The live database is strictly read-only. Path and database validation prevent accidental
-						self-overwrite. Zero INSERT, UPDATE, or DROP touches production — ever.</p>
+					<p>The production database is strictly read-only — zero INSERT, UPDATE, or DROP, ever. Promote
+						writes only the theme and plugin files you pick, always after a full backup with automatic
+						restore.</p>
 				</div>
 				<div class="feature-card">
 					<div class="feature-icon">
@@ -1336,7 +1353,22 @@
 					</div>
 					<h3>Promote & Restore</h3>
 					<p>Surgically promote specific themes, plugins, and mu-plugins from staging to live. Automated
-						tar.gz backup before each operation with atomic restore on failure.</p>
+						tar.gz backup before each operation with automatic restore on failure.</p>
+				</div>
+				<div class="feature-card">
+					<div class="feature-icon">
+						<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+							stroke-linecap="round">
+							<path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
+							<circle cx="12" cy="12" r="3" />
+						</svg>
+					</div>
+					<h3>Dry-Run Preview</h3>
+					<p>Run with <code
+							style="font-family:'JetBrains Mono',monospace;font-size:12px;background:var(--bg-subtle);padding:1px 5px;border-radius:3px">-n</code>
+						to see exactly what a sync would export, transfer, and replace — every table, file, and command
+						—
+						without writing a single byte.</p>
 				</div>
 			</div>
 		</div>
@@ -1457,8 +1489,9 @@
 		<div class="container">
 			<div class="section-label">Safety</div>
 			<h2>Production is safe.</h2>
-			<p class="section-desc">Every mutation targets staging. The live site connection is enforced read-only at
-				the query level.</p>
+			<p class="section-desc">The production database is enforced read-only at the query level. The default
+				Live → Staging sync never writes to production at all; promote writes only the files you select,
+				always after a backup.</p>
 			<div class="safety-grid">
 				<div class="safety-item">
 					<div class="safety-check">
@@ -1469,7 +1502,8 @@
 					</div>
 					<div>
 						<h4>Read-only live connection</h4>
-						<p>Only SELECT and SHOW queries run against production. Zero writes — ever.</p>
+						<p>Only SELECT and SHOW queries run against the production database — in both modes. Zero
+							database writes, ever.</p>
 					</div>
 				</div>
 				<div class="safety-item">
@@ -1481,7 +1515,8 @@
 					</div>
 					<div>
 						<h4>Path validation</h4>
-						<p>Aborts if live and stage directories resolve to the same filesystem path.</p>
+						<p>Aborts if live and stage directories resolve to the same filesystem path (symlinks included).
+						</p>
 					</div>
 				</div>
 				<div class="safety-item">
@@ -1493,7 +1528,8 @@
 					</div>
 					<div>
 						<h4>Database validation</h4>
-						<p>Aborts if live and staging point to the same database name and host.</p>
+						<p>Aborts if live and staging resolve to the same database — compared by server identity, not
+							just the host string.</p>
 					</div>
 				</div>
 				<div class="safety-item">
@@ -1504,8 +1540,9 @@
 						</svg>
 					</div>
 					<div>
-						<h4>Staging-only mutations</h4>
-						<p>All DROP, INSERT, rsync --delete, chown, and WP-CLI calls target staging exclusively.</p>
+						<h4>Backed-up promotes</h4>
+						<p>Promote writes the files you select to live by design — after a full backup, with automatic
+							restore on failure. The live database is never touched.</p>
 					</div>
 				</div>
 			</div>
@@ -1546,7 +1583,10 @@
 							<pre>curl -sSL https://ada.tools/wp-stage-sync/install.sh | bash</pre>
 						</div>
 						<p class="install-note">Auto-detects amd64 / arm64. Resolves the latest release tag via GitHub
-							API.</p>
+							API. Piping to <code
+								style="font-family:'JetBrains Mono',monospace;font-size:12px">bash</code>?
+							<a href="#disclaimer">Did you see the disclaimer?</a>
+						</p>
 					</div>
 				</div>
 				<div class="install-card">

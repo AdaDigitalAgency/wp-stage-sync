@@ -3,6 +3,7 @@ package sync
 import (
 	"database/sql"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,31 +16,77 @@ import (
 	"github.com/AdaDigitalAgency/wp-stage-sync/internal/wpcli"
 )
 
-// Import executes Step 1: drop all staging tables and import the exported SQL.
+// backupPrefix names tables moved aside during import so a failure can roll back.
+const backupPrefix = "_wpss_bak_"
+
+// Import executes Step 1: move existing staging tables aside, import the
+// exported SQL, then drop the backups (or restore them if the import fails).
 func Import(stageDB *sql.DB, exp *export.Result, log progress.Logger) error {
 	log.Detail("Disabling foreign key checks")
 	if _, err := stageDB.Exec("SET FOREIGN_KEY_CHECKS=0"); err != nil {
 		return fmt.Errorf("disabling FK checks: %w", err)
 	}
-	// Raise packet limit so large INSERTs (wp_posts with big post_content) don't kill the connection
-	if _, err := stageDB.Exec("SET GLOBAL max_allowed_packet=268435456"); err != nil {
-		// Non-fatal: may lack SUPER privilege, proceed with default
-		_ = err
+	// Raise the packet limit for this session so a large INSERT (e.g. a big
+	// post_content) doesn't reset the connection. This is session-settable on
+	// MariaDB; on MySQL it is read-only, so we surface the limitation rather
+	// than SET GLOBAL it (which would affect every database on the server).
+	if _, err := stageDB.Exec("SET SESSION max_allowed_packet=268435456"); err != nil {
+		log.Detail("Note: could not raise session max_allowed_packet; raise the server's max_allowed_packet if a very large row fails to import")
 	}
 
-	// Drop all existing tables
 	tables, err := listTables(stageDB)
 	if err != nil {
 		return fmt.Errorf("listing tables: %w", err)
 	}
-	log.Detail(fmt.Sprintf("Dropping %d existing tables", len(tables)))
+
+	// Move existing tables aside (a RENAME is instant — no data copy) so a
+	// failed import can be rolled back. Drop any stale backups left by a
+	// previously crashed run first.
+	var live []string
 	for _, t := range tables {
-		if _, err := stageDB.Exec(fmt.Sprintf("DROP TABLE IF EXISTS `%s`", t)); err != nil {
-			return fmt.Errorf("dropping %s: %w", t, err)
+		if strings.HasPrefix(t, backupPrefix) {
+			if _, err := stageDB.Exec(fmt.Sprintf("DROP TABLE IF EXISTS `%s`", t)); err != nil {
+				return fmt.Errorf("clearing stale backup %s: %w", t, err)
+			}
+			continue
+		}
+		live = append(live, t)
+	}
+
+	log.Detail(fmt.Sprintf("Backing up %d existing tables", len(live)))
+	backups := make(map[string]string, len(live)) // backup name -> original name
+	for i, t := range live {
+		bak := fmt.Sprintf("%s%d", backupPrefix, i)
+		if _, err := stageDB.Exec(fmt.Sprintf("RENAME TABLE `%s` TO `%s`", t, bak)); err != nil {
+			restoreBackups(stageDB, backups, log)
+			return fmt.Errorf("backing up %s: %w", t, err)
+		}
+		backups[bak] = t
+	}
+
+	// Import; restore the backups if anything fails partway through.
+	if err := execImport(stageDB, exp, log); err != nil {
+		log.Detail("Import failed — restoring previous staging tables")
+		restoreBackups(stageDB, backups, log)
+		return err
+	}
+
+	log.Detail("Removing backup tables")
+	for bak := range backups {
+		if _, err := stageDB.Exec(fmt.Sprintf("DROP TABLE IF EXISTS `%s`", bak)); err != nil {
+			return fmt.Errorf("removing backup %s: %w", bak, err)
 		}
 	}
 
-	// Execute in order: schema-only, base, users, orders
+	log.Detail("Re-enabling foreign key checks")
+	if _, err := stageDB.Exec("SET FOREIGN_KEY_CHECKS=1"); err != nil {
+		return fmt.Errorf("re-enabling FK checks: %w", err)
+	}
+	return nil
+}
+
+// execImport runs the exported statements in order: schema-only, base, users, orders.
+func execImport(stageDB *sql.DB, exp *export.Result, log progress.Logger) error {
 	groups := []struct {
 		name  string
 		stmts []string
@@ -69,12 +116,25 @@ func Import(stageDB *sql.DB, exp *export.Result, log progress.Logger) error {
 			log.Progress(doneStmts, totalStmts)
 		}
 	}
-
-	log.Detail("Re-enabling foreign key checks")
-	if _, err := stageDB.Exec("SET FOREIGN_KEY_CHECKS=1"); err != nil {
-		return fmt.Errorf("re-enabling FK checks: %w", err)
-	}
 	return nil
+}
+
+// restoreBackups drops any partially-imported tables and renames the backups
+// back to their original names. Best-effort: warnings are logged, not returned.
+func restoreBackups(stageDB *sql.DB, backups map[string]string, log progress.Logger) {
+	if cur, err := listTables(stageDB); err == nil {
+		for _, t := range cur {
+			if strings.HasPrefix(t, backupPrefix) {
+				continue
+			}
+			_, _ = stageDB.Exec(fmt.Sprintf("DROP TABLE IF EXISTS `%s`", t))
+		}
+	}
+	for bak, orig := range backups {
+		if _, err := stageDB.Exec(fmt.Sprintf("RENAME TABLE `%s` TO `%s`", bak, orig)); err != nil {
+			log.Detail(fmt.Sprintf("WARNING: could not restore %s from backup %s: %v", orig, bak, err))
+		}
+	}
 }
 
 // DefaultExcludes are the default rsync exclude patterns.
@@ -122,10 +182,42 @@ type PlannedCommand struct {
 	SkipNote string
 }
 
+// hostFromURL returns the bare host (no scheme, no path) of a site URL such as
+// "https://example.com/blog" → "example.com". If s is already a bare host it is
+// returned cleaned.
+func hostFromURL(s string) string {
+	s = strings.TrimSpace(s)
+	if u, err := url.Parse(s); err == nil && u.Host != "" {
+		return u.Host
+	}
+	s = strings.TrimPrefix(s, "https://")
+	s = strings.TrimPrefix(s, "http://")
+	s = strings.TrimPrefix(s, "//")
+	if i := strings.IndexByte(s, '/'); i >= 0 {
+		s = s[:i]
+	}
+	return s
+}
+
+// SiteHost returns the host of the site's home/siteurl from the options table,
+// falling back to the provided default when it cannot be read.
+func SiteHost(db *sql.DB, prefix, fallback string) string {
+	for _, opt := range []string{"home", "siteurl"} {
+		var val string
+		q := fmt.Sprintf("SELECT option_value FROM `%soptions` WHERE option_name = ? LIMIT 1", prefix)
+		if err := db.QueryRow(q, opt).Scan(&val); err == nil {
+			if h := hostFromURL(val); h != "" {
+				return h
+			}
+		}
+	}
+	return fallback
+}
+
 // postProcessCommands builds the ordered WP-CLI command list (with skip
 // decisions) shared by PostProcess and PostProcessPlan. wpBase is the resolved
 // wp-cli invocation, e.g. ["wp"] or ["php", "/path/to/wp-cli.phar"].
-func postProcessCommands(wpBase []string, stagePath, liveDomain, stageDomain string) []PlannedCommand {
+func postProcessCommands(wpBase []string, stagePath, liveHost, stageHost string) []PlannedCommand {
 	wpArgs := func(args ...string) []string {
 		cmd := make([]string, len(wpBase), len(wpBase)+len(args))
 		copy(cmd, wpBase)
@@ -135,45 +227,57 @@ func postProcessCommands(wpBase []string, stagePath, liveDomain, stageDomain str
 	hasElementor := dirExists(filepath.Join(stagePath, "wp-content", "plugins", "elementor"))
 	hasJetpack := dirExists(filepath.Join(stagePath, "wp-content", "plugins", "jetpack"))
 
-	return []PlannedCommand{
-		{
-			Label: fmt.Sprintf("Search-replace: %s → %s", liveDomain, stageDomain),
-			Args: wpArgs("search-replace",
-				"https://"+liveDomain, "https://"+stageDomain,
+	var cmds []PlannedCommand
+
+	// Replace https, then http, then protocol-relative. Doing the scheme-
+	// prefixed forms first means the bare "//host" pass only hits genuine
+	// protocol-relative URLs, and never a bare hostname (which would corrupt
+	// email addresses and the like).
+	for _, p := range []string{"https://", "http://", "//"} {
+		from, to := p+liveHost, p+stageHost
+		cmds = append(cmds, PlannedCommand{
+			Label: fmt.Sprintf("Search-replace: %s → %s", from, to),
+			Args: wpArgs("search-replace", from, to,
 				"--all-tables", "--allow-root", "--path="+stagePath),
-		},
-		{
-			Label: "Elementor URL replace",
+		})
+	}
+
+	for _, p := range []string{"https://", "http://"} {
+		cmds = append(cmds, PlannedCommand{
+			Label: fmt.Sprintf("Elementor URL replace: %s%s → %s%s", p, liveHost, p, stageHost),
 			Args: wpArgs("elementor", "replace-urls",
-				"https://"+liveDomain, "https://"+stageDomain,
-				"--allow-root", "--path="+stagePath),
+				p+liveHost, p+stageHost, "--allow-root", "--path="+stagePath),
 			Skip:     !hasElementor,
 			SkipNote: "elementor plugin not installed",
-		},
-		{
+		})
+	}
+
+	cmds = append(cmds,
+		PlannedCommand{
 			Label: "Jetpack safe mode",
 			Args: wpArgs("option", "update", "jetpack_safe_mode_confirmed", "1",
 				"--allow-root", "--quiet", "--path="+stagePath),
 			Skip:     !hasJetpack,
 			SkipNote: "jetpack plugin not installed",
 		},
-		{
+		PlannedCommand{
 			Label:    "Cache flush",
 			Args:     wpArgs("cache", "flush", "--allow-root", "--path="+stagePath),
 			Skip:     !config.LoadSettings().AutoCacheFlush,
 			SkipNote: "auto cache flush disabled in settings",
 		},
-	}
+	)
+	return cmds
 }
 
 // PostProcess executes Step 3: WP-CLI search-replace and cache flush.
-func PostProcess(stagePath, liveDomain, stageDomain string, log progress.Logger) error {
+func PostProcess(stagePath, liveHost, stageHost string, log progress.Logger) error {
 	wpBase, err := wpcli.Resolve()
 	if err != nil {
 		return fmt.Errorf("wp-cli: %w", err)
 	}
 
-	commands := postProcessCommands(wpBase, stagePath, liveDomain, stageDomain)
+	commands := postProcessCommands(wpBase, stagePath, liveHost, stageHost)
 	for i, c := range commands {
 		if c.Skip {
 			log.Detail(fmt.Sprintf("Skipping: %s (%s)", c.Label, c.SkipNote))
@@ -298,6 +402,48 @@ func Anonymize(db *sql.DB, prefix string, log progress.Logger) error {
 		if _, err := db.Exec(addressQuery); err != nil {
 			return fmt.Errorf("anonymizing order addresses: %w", err)
 		}
+	}
+
+	// 4. wc_orders (HPOS) holds PII not in wc_order_addresses: order email,
+	// customer IP/user-agent, and the free-text customer note.
+	ordersTable := prefix + "wc_orders"
+	var ordersCount int
+	if err := db.QueryRow("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?", ordersTable).Scan(&ordersCount); err == nil && ordersCount > 0 {
+		log.Detail("Anonymizing order records")
+		ordersQuery := fmt.Sprintf(`
+			UPDATE %swc_orders
+			SET
+				billing_email = CONCAT('order_', id, '@example.com'),
+				ip_address = '',
+				user_agent = '',
+				customer_note = ''
+		`, prefix)
+		if _, err := db.Exec(ordersQuery); err != nil {
+			return fmt.Errorf("anonymizing orders: %w", err)
+		}
+	}
+
+	// 5. Scrub order notes (comments): clear author email/IP, and replace the
+	// body of customer notes.
+	log.Detail("Anonymizing order notes")
+	notesQuery := fmt.Sprintf(`
+		UPDATE %scomments
+		SET comment_author_email = '', comment_author_IP = ''
+		WHERE comment_type = 'order_note'
+	`, prefix)
+	if _, err := db.Exec(notesQuery); err != nil {
+		return fmt.Errorf("anonymizing order notes: %w", err)
+	}
+
+	customerNoteQuery := fmt.Sprintf(`
+		UPDATE %scomments c
+		INNER JOIN %scommentmeta cm
+			ON c.comment_ID = cm.comment_id AND cm.meta_key = 'is_customer_note'
+		SET c.comment_content = '[customer note removed]'
+		WHERE c.comment_type = 'order_note' AND cm.meta_value = '1'
+	`, prefix, prefix)
+	if _, err := db.Exec(customerNoteQuery); err != nil {
+		return fmt.Errorf("anonymizing customer notes: %w", err)
 	}
 
 	return nil

@@ -5,6 +5,41 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-06-11
+
+### Added
+
+- Unit tests for guardrail path/DB checks, export table classification, `wp-config.php` parsing, and site-host extraction.
+
+### Changed
+
+- Domain search-replace now uses the real site host from the database (`home`/`siteurl`) instead of the webroot directory name, and rewrites `http://`, `https://`, and protocol-relative (`//host`) URLs.
+- Staging import now moves existing tables aside and restores them if the import fails, instead of dropping everything up front (no more half-wiped staging on a failed sync).
+- Import raises `max_allowed_packet` for its own session instead of globally, so it no longer changes the setting for every database on a shared MySQL server; if the server won't allow it, a note is printed.
+- Database connections are now built with the driver's DSN builder, so DB passwords containing `@ : / ?` no longer break the connection.
+- `wp-config.php` parser now reads quoted values with escapes, so DB passwords containing quotes or backslashes are parsed correctly instead of being truncated.
+- Promote backups are now finalized and flushed to disk before being recorded, so a truncated archive can't be treated as a valid backup. A failed automatic restore is now reported in the error, and restore no longer removes paths outside live `wp-content`.
+- Binary/blob column values are exported as hexadecimal literals (`0x…`) instead of escaped text, preventing corruption of binary data on import.
+- Generated/virtual columns are omitted from exported `INSERT`s (the database recomputes them on import), so tables that use them no longer fail to import.
+- Unattended progress now updates a single in-place line per step in a terminal (the bar and its current item share one line), while standalone status lines are kept. Redirected output (cron/logs) prints only the final state of each bar.
+- Clarified README and website safety wording: the default Live → Staging sync never writes to production; promote writes production files (always after a backup, with auto-restore) but never the production database.
+- Documented anonymization scope: it masks standard WooCommerce/WordPress customer fields and is not a guarantee that every plugin's PII or secret is scrubbed.
+
+### Fixed
+
+- Sync no longer aborts on non-WooCommerce sites — order/user/comment filtering is skipped when WooCommerce is absent and all tables (users, comments, etc.) are exported in full.
+- Blog comments and product reviews are now synced on WooCommerce sites; previously only order notes were exported. Order notes stay limited to the synced orders.
+- Tables left as `custom_rule` but not specially handled are now exported in full instead of being silently dropped.
+- Anonymization now masks PII in `wc_orders` (order email, IP, user-agent, customer note) and order notes; previously these were left intact.
+- Path guardrails now resolve symlinks, so a stage path symlinked into the live tree is correctly rejected.
+- Added an authoritative same-database guard after connecting (compares server identity + schema), catching cases string comparison missed (`localhost` vs `127.0.0.1`, socket vs TCP).
+
+### Security
+
+- `--update` now verifies the downloaded binary against the release `checksums.txt` (SHA256) before replacing the running executable.
+- WP-CLI PHAR fallback now downloads a pinned version and verifies its SHA256 against a hardcoded value before use, storing it `0700`. A bad or tampered download is rejected.
+- Backup restore now rejects archive entries whose paths would escape the extraction directory (path traversal).
+
 ## [0.5.1] - 2026-06-10
 
 ### Added

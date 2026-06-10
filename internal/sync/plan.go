@@ -62,7 +62,7 @@ type PostProcessReport struct {
 
 // PostProcessPlan reports which WP-CLI commands PostProcess would run, without
 // executing them and without downloading wp-cli if it is missing.
-func PostProcessPlan(stagePath, liveDomain, stageDomain string) *PostProcessReport {
+func PostProcessPlan(stagePath, liveHost, stageHost string) *PostProcessReport {
 	wpBase, ok := wpcli.ResolveExisting()
 	display := wpBase
 	if !ok {
@@ -73,6 +73,6 @@ func PostProcessPlan(stagePath, liveDomain, stageDomain string) *PostProcessRepo
 	return &PostProcessReport{
 		WPAvailable: ok,
 		WPBase:      display,
-		Commands:    postProcessCommands(display, stagePath, liveDomain, stageDomain),
+		Commands:    postProcessCommands(display, stagePath, liveHost, stageHost),
 	}
 }

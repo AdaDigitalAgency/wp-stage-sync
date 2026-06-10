@@ -113,12 +113,17 @@ func CreateBackup(domain string, items []SelectedItem, log progress.Logger) (str
 	if err != nil {
 		return "", fmt.Errorf("creating archive: %w", err)
 	}
-	defer f.Close()
-
 	gw := gzip.NewWriter(f)
-	defer gw.Close()
 	tw := tar.NewWriter(gw)
-	defer tw.Close()
+
+	// fail closes the writers and removes the partial archive.
+	fail := func(format string, a ...interface{}) (string, error) {
+		tw.Close()
+		gw.Close()
+		f.Close()
+		os.Remove(archivePath)
+		return "", fmt.Errorf(format, a...)
+	}
 
 	var backupItems []BackupItem
 	for i, item := range items {
@@ -138,7 +143,7 @@ func CreateBackup(domain string, items []SelectedItem, log progress.Logger) (str
 		// Use a relative prefix for the archive: type/name/...
 		prefix := string(item.Type) + "/" + item.Name
 		if err := addToTar(tw, item.LivePath, prefix); err != nil {
-			return "", fmt.Errorf("archiving %s %s: %w", item.Type, item.Name, err)
+			return fail("archiving %s %s: %w", item.Type, item.Name, err)
 		}
 
 		backupItems = append(backupItems, BackupItem{
@@ -149,6 +154,22 @@ func CreateBackup(domain string, items []SelectedItem, log progress.Logger) (str
 	}
 	log.Progress(len(items), len(items))
 
+	// Finalize and flush the archive to disk before it is recorded as valid, so
+	// a truncated archive is never treated as a usable backup.
+	if err := tw.Close(); err != nil {
+		return fail("finalizing archive: %w", err)
+	}
+	if err := gw.Close(); err != nil {
+		return fail("finalizing gzip: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		return fail("flushing archive: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(archivePath)
+		return "", fmt.Errorf("closing archive: %w", err)
+	}
+
 	// Write metadata sidecar
 	meta := BackupMeta{
 		Domain:    domain,
@@ -157,9 +178,11 @@ func CreateBackup(domain string, items []SelectedItem, log progress.Logger) (str
 	}
 	metaData, err := json.MarshalIndent(meta, "", "  ")
 	if err != nil {
+		os.Remove(archivePath)
 		return "", err
 	}
 	if err := os.WriteFile(metaPath, metaData, 0644); err != nil {
+		os.Remove(archivePath)
 		return "", err
 	}
 
@@ -288,8 +311,10 @@ func Execute(items []SelectedItem, livePath, archivePath string, log progress.Lo
 		info, err := os.Stat(src)
 		if err != nil {
 			log.Detail(fmt.Sprintf("Failed: %s not found on staging", item.Name))
-			autoRestore(archivePath, livePath, log)
-			return fmt.Errorf("promote failed for %s %s: %w", item.Type, item.Name, err)
+			if rerr := autoRestore(archivePath, livePath, log); rerr != nil {
+				return fmt.Errorf("promote failed for %s %s: %w; live may be inconsistent — %v", item.Type, item.Name, err, rerr)
+			}
+			return fmt.Errorf("promote failed for %s %s: %w — live restored from backup", item.Type, item.Name, err)
 		}
 
 		var args []string
@@ -304,8 +329,10 @@ func Execute(items []SelectedItem, livePath, archivePath string, log progress.Lo
 		cmd := exec.Command("rsync", args...)
 		if err := cmd.Run(); err != nil {
 			log.Detail(fmt.Sprintf("rsync failed for %s %s: %v", item.Type, item.Name, err))
-			autoRestore(archivePath, livePath, log)
-			return fmt.Errorf("promote failed for %s %s: %w — automatic restore triggered", item.Type, item.Name, err)
+			if rerr := autoRestore(archivePath, livePath, log); rerr != nil {
+				return fmt.Errorf("promote failed for %s %s: %w; live may be inconsistent — %v", item.Type, item.Name, err, rerr)
+			}
+			return fmt.Errorf("promote failed for %s %s: %w — live restored from backup", item.Type, item.Name, err)
 		}
 	}
 	log.Progress(len(items), len(items))
@@ -323,18 +350,17 @@ func Execute(items []SelectedItem, livePath, archivePath string, log progress.Lo
 	return nil
 }
 
-func autoRestore(archivePath, livePath string, log progress.Logger) {
+func autoRestore(archivePath, livePath string, log progress.Logger) error {
 	log.Step("Automatic restore triggered")
 	meta, err := LoadBackupMeta(archivePath)
 	if err != nil {
-		log.Detail(fmt.Sprintf("CRITICAL: Could not load backup metadata: %v", err))
-		return
+		return fmt.Errorf("could not load backup metadata: %w", err)
 	}
 	if err := RestoreFromBackup(archivePath, meta, livePath, log); err != nil {
-		log.Detail(fmt.Sprintf("CRITICAL: Automatic restore failed: %v", err))
-	} else {
-		log.StepDone("Automatic restore completed successfully")
+		return fmt.Errorf("automatic restore failed: %w", err)
 	}
+	log.StepDone("Automatic restore completed successfully")
+	return nil
 }
 
 // LoadBackupMeta reads the JSON sidecar for a backup archive.
@@ -374,8 +400,14 @@ func RestoreFromBackup(archivePath string, meta *BackupMeta, livePath string, lo
 		// Check if the item was in the backup
 		info, err := os.Stat(extractedPath)
 		if os.IsNotExist(err) {
-			// Item didn't exist on live before promote — remove it
-			os.RemoveAll(item.LivePath)
+			// Item didn't exist on live before promote — remove what the promote
+			// added, but only if the path is safely inside live wp-content (guard
+			// against a bad metadata entry triggering a destructive removal).
+			if underWPContent(livePath, item.LivePath) {
+				os.RemoveAll(item.LivePath)
+			} else {
+				log.Detail(fmt.Sprintf("WARNING: skipping removal of %q (outside live wp-content)", item.LivePath))
+			}
 			continue
 		}
 		if err != nil {
@@ -409,6 +441,25 @@ func RestoreFromBackup(archivePath string, meta *BackupMeta, livePath string, lo
 	return nil
 }
 
+// safeJoin joins destDir and an archive member name, rejecting names that would
+// escape destDir (path traversal from a crafted archive).
+func safeJoin(destDir, name string) (string, error) {
+	target := filepath.Join(destDir, name)
+	clean := filepath.Clean(destDir)
+	if target != clean && !strings.HasPrefix(target, clean+string(os.PathSeparator)) {
+		return "", fmt.Errorf("unsafe path in archive: %q", name)
+	}
+	return target, nil
+}
+
+// underWPContent reports whether target is a path strictly inside the live
+// wp-content directory — a guard before any destructive removal.
+func underWPContent(livePath, target string) bool {
+	base := filepath.Clean(filepath.Join(livePath, "wp-content"))
+	t := filepath.Clean(target)
+	return t != base && strings.HasPrefix(t, base+string(os.PathSeparator))
+}
+
 func extractTarGz(archivePath, destDir string) error {
 	f, err := os.Open(archivePath)
 	if err != nil {
@@ -432,7 +483,10 @@ func extractTarGz(archivePath, destDir string) error {
 			return err
 		}
 
-		target := filepath.Join(destDir, header.Name)
+		target, err := safeJoin(destDir, header.Name)
+		if err != nil {
+			return err
+		}
 
 		switch header.Typeflag {
 		case tar.TypeDir:
