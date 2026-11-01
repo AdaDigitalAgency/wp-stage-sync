@@ -32,6 +32,8 @@ type Config struct {
 type Settings struct {
 	BackupRetention int  `json:"backup_retention"`
 	AutoCacheFlush  bool `json:"auto_cache_flush"`
+	// WhatsNewSeen is the newest version whose release notes the TUI has shown.
+	WhatsNewSeen string `json:"whats_new_seen,omitempty"`
 }
 
 func DefaultSettings() Settings {

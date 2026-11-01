@@ -18,6 +18,7 @@ import (
 	"github.com/AdaDigitalAgency/wp-stage-sync/internal/progress"
 	"github.com/AdaDigitalAgency/wp-stage-sync/internal/promote"
 	"github.com/AdaDigitalAgency/wp-stage-sync/internal/sync"
+	"github.com/AdaDigitalAgency/wp-stage-sync/internal/whatsnew"
 	"github.com/AdaDigitalAgency/wp-stage-sync/internal/wpconfig"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -102,6 +103,9 @@ type model struct {
 	spinnerFrame    int
 	currentVersion  string
 	updateAvailable string // latest version, empty if up to date
+	whatsNew        []whatsnew.Release
+	newsRecorded    bool // whatsNew was saved as seen in settings
+	newsHidesBanner bool // the home screen drops the banner to fit whatsNew
 
 	// Promote flow
 	promoteAllItems    []promote.SelectedItem // all available items (flat list)
@@ -147,6 +151,7 @@ func Run(currentVersion, latestVersion string) error {
 	m := initialModel()
 	m.currentVersion = currentVersion
 	m.updateAvailable = latestVersion
+	m = m.loadNews()
 	p := tea.NewProgram(m, tea.WithAltScreen())
 	activeProgram = p
 	_, err := p.Run()
@@ -220,7 +225,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-		return m, nil
+		return m.layoutNews().recordNewsIfShown(), nil
 
 	case syncDoneMsg:
 		switch m.step {
@@ -354,7 +359,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m model) View() string {
 	var b strings.Builder
 
-	if (m.step == stepStartup || m.step == stepPaths) && m.width >= 60 && m.height >= 24 {
+	hideBanner := m.step == stepStartup && m.newsHidesBanner
+	if (m.step == stepStartup || m.step == stepPaths) && m.width >= 60 && m.height >= 24 && !hideBanner {
 		// Generated using https://patorjk.com/software/taag/#p=display&f=Rebel&t=WP+STAGE%0A+++++++SYNC&x=none&v=4&h=4&w=80&we=false
 		banner := titleStyle.Render(`
    █████   ███   █████ ███████████      █████████  ███████████   █████████     █████████  ██████████
@@ -419,6 +425,12 @@ func (m model) View() string {
 				b.WriteString(selectedStyle.Render("▸ Configure new site...") + "\n")
 			} else {
 				b.WriteString("  " + dimStyle.Render("Configure new site...") + "\n")
+			}
+			if block, ok := m.newsBlock(); ok {
+				b.WriteString("\n" + sectionStyle.Render(block.Heading) + "\n")
+				for _, line := range block.Lines {
+					b.WriteString("  " + dimStyle.Render(line) + "\n")
+				}
 			}
 
 		case stepPaths:
@@ -893,6 +905,68 @@ func (m model) renderDone(label string) string {
 	}
 	b.WriteString("\n" + dimStyle.Render("Press Enter or q to exit"))
 	return b.String()
+}
+
+// loadNews selects the release notes for the home screen. A first install has
+// no saved sites and no seen version, so it starts with nothing to show.
+func (m model) loadNews() model {
+	if !whatsnew.IsRelease(m.currentVersion) {
+		return m
+	}
+	seen := config.LoadSettings().WhatsNewSeen
+	if seen != "" || len(m.savedSites) > 0 {
+		m.whatsNew = whatsnew.For(seen, m.currentVersion, whatsnew.Entries)
+	}
+	if len(m.whatsNew) == 0 {
+		m = m.recordNews()
+	}
+	return m
+}
+
+// newsBlock fits the release notes into the rows the home screen has left.
+func (m model) newsBlock() (whatsnew.Block, bool) {
+	if len(m.whatsNew) == 0 || m.height == 0 {
+		return whatsnew.Block{}, false
+	}
+	without := m
+	without.whatsNew = nil
+	return whatsnew.Fit(m.whatsNew, m.height-lipgloss.Height(without.View()))
+}
+
+// layoutNews drops the banner when it leaves too little room for the news. At
+// 80x24 the banner fills the screen, and the news would otherwise never appear.
+func (m model) layoutNews() model {
+	m.newsHidesBanner = false
+	if m.step != stepStartup || len(m.whatsNew) == 0 {
+		return m
+	}
+	total := 0
+	for _, r := range m.whatsNew {
+		total += len(r.Items)
+	}
+	block, ok := m.newsBlock()
+	m.newsHidesBanner = !ok || len(block.Lines) < min(total, whatsnew.MaxLines)
+	return m
+}
+
+// recordNewsIfShown marks the news as seen once the home screen can draw it.
+// If the terminal is too short, the news waits for the next run.
+func (m model) recordNewsIfShown() model {
+	if m.newsRecorded || m.step != stepStartup {
+		return m
+	}
+	if _, ok := m.newsBlock(); ok {
+		return m.recordNews()
+	}
+	return m
+}
+
+func (m model) recordNews() model {
+	settings := config.LoadSettings()
+	settings.WhatsNewSeen = whatsnew.Later(settings.WhatsNewSeen, m.currentVersion)
+	_ = config.SaveSettings(settings)
+	m.newsRecorded = true
+	return m
 }
 
 func (m model) footerLeft() string {
