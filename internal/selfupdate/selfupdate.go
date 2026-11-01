@@ -7,9 +7,9 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"time"
 
+	"github.com/Masterminds/semver/v3"
 	"github.com/creativeprojects/go-selfupdate"
 )
 
@@ -87,14 +87,25 @@ func CheckVersion(currentVersion string) string {
 		return ""
 	}
 
-	// Normalize and compare: strip "v" prefix from both
-	cached := strings.TrimPrefix(state.LatestVersion, "v")
-	current := strings.TrimPrefix(currentVersion, "v")
-	if cached == current {
+	if !isNewer(state.LatestVersion, currentVersion) {
 		return ""
 	}
 
 	return state.LatestVersion
+}
+
+// isNewer reports whether latest is a higher semantic version than current.
+// Versions that do not parse are never newer, so a bad value shows no notice.
+func isNewer(latest, current string) bool {
+	l, err := semver.NewVersion(latest)
+	if err != nil {
+		return false
+	}
+	c, err := semver.NewVersion(current)
+	if err != nil {
+		return false
+	}
+	return l.GreaterThan(c)
 }
 
 type internalState struct {
