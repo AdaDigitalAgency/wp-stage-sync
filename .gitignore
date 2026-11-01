@@ -16,5 +16,8 @@ Thumbs.db
 # Build
 dist/
 
+# Deploy target
+.env
+
 # Config (contains credentials when saved)
 .sync-config.json

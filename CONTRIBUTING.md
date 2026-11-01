@@ -93,6 +93,15 @@ The tool does these steps, in order:
 
 Run `make ship` to resume after an interruption. It reads the real state and does only the remaining steps. Use `go run ./cmd/release minor --no-ship` to stop at the commit, and `go run ./cmd/release ship --dry-run` to print the steps.
 
+After shipping, the tool asks whether to deploy the website. Pass `--website` to skip the question. To deploy it alone:
+
+```bash
+make deploy-website        # dry run: lists the files that differ
+make deploy-website GO=1   # publishes them and checks the live page
+```
+
+The website deploy needs `.env` (see `.env.example`). It refuses uncommitted changes in `website/`, never uses `--delete`, and writes only to the path pinned in `internal/release/website.go`. A website failure does not affect a shipped release.
+
 Test on a real server before you release. CI does not cover a real WordPress install.
 
 ## Pull Requests
