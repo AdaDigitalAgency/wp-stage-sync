@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- The TUI home screen shows a short "What's new" block once after an update.
+
+### Changed
+
+- **Check your excludes before you update.** Nested folders that have the same name as an excluded folder now sync. The first sync after the update can transfer more files.
+- `--delete` no longer protects those nested folders, so a sync removes a nested folder that exists only on staging, such as `wp-content/uploads/cache`.
+- The release process now runs checks before and after the version bump, keeps commits instead of squashing them, and tags only after CI passes. CI now also runs on `main` and pull requests, and release notes come from this changelog.
+- A glob in a hand-edited `rsync_excludes`, such as `*.log`, now matches only at the top level of `wp-content/`. To match at every depth, add both `*.log` and `**/*.log`.
+
+### Fixed
+
+- Rsync excludes now apply only to the selected `wp-content/` folder. Before, excluding `cache` also skipped every nested folder of that name, such as `wp-content/plugins/foo/cache`.
+- Unchecking every folder in the exclude step now means "exclude nothing". Before, unattended runs silently fell back to the default excludes.
+- The exclude step no longer crashes when `wp-content` has no subfolders or cannot be read, and it shows the read error.
+- Saved excludes that are not `wp-content` subfolders, such as nested paths added by hand, stay in the exclude list instead of being dropped on the next run.
+- A TUI sync with no saved excludes now applies the default excludes, like unattended mode.
+- The update notice now appears only when a higher version exists. Before, any difference counted, so a newer or development build was told to "update" to an older release.
+- `rsync` and `chown` failures in sync and promote now report the command's own error output, not only the exit status.
+
 ## [0.6.0] - 2026-06-11
 
 ### Added
