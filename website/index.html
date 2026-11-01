@@ -1141,8 +1141,7 @@
 			</p>
 			<div class="install-block">
 				<span class="install-label">$ bash</span>
-				<span class="install-cmd" id="heroCmd">curl -sSL https://ada.tools/wp-stage-sync/install.sh |
-					bash</span>
+				<span class="install-cmd" id="heroCmd">curl -sSL https://ada.tools/wp-stage-sync/install.sh | bash</span>
 				<button class="copy-btn" id="heroCopy" title="Copy command">
 					<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
 						<rect x="9" y="9" width="13" height="13" rx="2" />
@@ -1842,6 +1841,12 @@
 			setTheme(html.getAttribute('data-theme') !== 'dark');
 		});
 
+		// These elements hold one line of text. A formatter can wrap the markup,
+		// and textContent keeps that wrap, so copy the text as the page shows it.
+		function oneLine(el) {
+			return el.textContent.replace(/\s+/g, ' ').trim();
+		}
+
 		function copyText(text, btn) {
 			navigator.clipboard.writeText(text).then(() => {
 				const orig = btn.innerHTML;
@@ -1851,11 +1856,11 @@
 		}
 
 		document.getElementById('heroCopy').addEventListener('click', function () {
-			copyText(document.getElementById('heroCmd').textContent.trim(), this);
+			copyText(oneLine(document.getElementById('heroCmd')), this);
 		});
 
 		document.getElementById('trustCopy').addEventListener('click', function () {
-			const text = document.getElementById('trustPrompt').textContent.trim();
+			const text = oneLine(document.getElementById('trustPrompt'));
 			navigator.clipboard.writeText(text).then(() => {
 				const label = this.querySelector('span');
 				const orig = label.textContent;
