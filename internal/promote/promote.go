@@ -15,6 +15,7 @@ import (
 
 	"github.com/AdaDigitalAgency/wp-stage-sync/internal/config"
 	"github.com/AdaDigitalAgency/wp-stage-sync/internal/progress"
+	"github.com/AdaDigitalAgency/wp-stage-sync/internal/sync"
 	"github.com/AdaDigitalAgency/wp-stage-sync/internal/wpcli"
 )
 
@@ -327,7 +328,8 @@ func Execute(items []SelectedItem, livePath, archivePath string, log progress.Lo
 		}
 
 		cmd := exec.Command("rsync", args...)
-		if err := cmd.Run(); err != nil {
+		if out, err := cmd.CombinedOutput(); err != nil {
+			err = sync.CommandError(err, out)
 			log.Detail(fmt.Sprintf("rsync failed for %s %s: %v", item.Type, item.Name, err))
 			if rerr := autoRestore(archivePath, livePath, log); rerr != nil {
 				return fmt.Errorf("promote failed for %s %s: %w; live may be inconsistent — %v", item.Type, item.Name, err, rerr)
@@ -423,8 +425,8 @@ func RestoreFromBackup(archivePath string, meta *BackupMeta, livePath string, lo
 		}
 
 		cmd := exec.Command("rsync", args...)
-		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("restoring %s %s: %w", item.Type, item.Name, err)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("restoring %s %s: %w", item.Type, item.Name, sync.CommandError(err, out))
 		}
 	}
 	log.Progress(len(meta.Items), len(meta.Items))

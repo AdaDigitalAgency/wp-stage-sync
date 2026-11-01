@@ -171,11 +171,13 @@ Drops all staging tables, imports with `FOREIGN_KEY_CHECKS=0`.
 ### File sync (Step 2)
 
 ```
-rsync -av --delete --exclude='cache' --exclude='ewww' \
-  --exclude='critical-css' --exclude='litespeed' \
-  --exclude='updraft' --exclude='archive-master-db' \
+rsync -a --delete --exclude='/cache' --exclude='/ewww' \
+  --exclude='/critical-css' --exclude='/litespeed' \
+  --exclude='/updraft' --exclude='/archive-master-db' \
   /home/{domain}/wp-content/ /home/stage.{domain}/wp-content/
 ```
+
+Excludes are anchored to `wp-content/`: excluding `cache` skips `wp-content/cache` only, not a nested folder such as `wp-content/plugins/foo/cache`.
 
 Ownership is detected from the staging webroot and applied via `chown -R`. Falls back to `www-data:www-data`.
 

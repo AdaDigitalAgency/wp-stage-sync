@@ -33,9 +33,7 @@ func FileSyncPlan(livePath, stagePath string, excludes []string) (*RsyncPlan, er
 	dst := filepath.Join(stagePath, "wp-content") + "/"
 
 	args := []string{"-a", "--delete", "--dry-run", "--stats"}
-	for _, ex := range excludes {
-		args = append(args, "--exclude="+ex)
-	}
+	args = append(args, excludeArgs(excludes)...)
 	args = append(args, src, dst)
 
 	plan := &RsyncPlan{
@@ -48,7 +46,7 @@ func FileSyncPlan(livePath, stagePath string, excludes []string) (*RsyncPlan, er
 	out, err := cmd.CombinedOutput()
 	plan.Output = strings.TrimRight(string(out), "\n")
 	if err != nil {
-		return plan, fmt.Errorf("rsync --dry-run: %w", err)
+		return plan, fmt.Errorf("rsync --dry-run: %w", CommandError(err, out))
 	}
 	return plan, nil
 }

@@ -137,7 +137,7 @@ func restoreBackups(stageDB *sql.DB, backups map[string]string, log progress.Log
 	}
 }
 
-// DefaultExcludes are the default rsync exclude patterns.
+// DefaultExcludes are the default rsync excludes, relative to wp-content.
 var DefaultExcludes = []string{
 	"cache",
 	"ewww",
@@ -147,6 +147,45 @@ var DefaultExcludes = []string{
 	"archive-master-db",
 }
 
+// maxOutputLines limits how much command output CommandError keeps. A failing
+// rsync or chown can print one line per file.
+const maxOutputLines = 10
+
+// CommandError adds the last lines of a command's output to err, because the
+// exit status alone does not say why the command failed.
+func CommandError(err error, output []byte) error {
+	text := strings.TrimSpace(string(output))
+	if text == "" {
+		return err
+	}
+	lines := strings.Split(text, "\n")
+	if len(lines) > maxOutputLines {
+		lines = lines[len(lines)-maxOutputLines:]
+	}
+	return fmt.Errorf("%w: %s", err, strings.Join(lines, "\n"))
+}
+
+// ResolveExcludes returns the excludes to use for a sync. Nil means none were
+// ever chosen, so the defaults apply. An empty list means the user unchecked
+// every folder, so nothing is excluded.
+func ResolveExcludes(saved []string) []string {
+	if saved == nil {
+		return DefaultExcludes
+	}
+	return saved
+}
+
+// excludeArgs builds rsync --exclude flags. Each exclude is anchored to the
+// transfer root (wp-content), because rsync matches a pattern with no leading
+// slash at every depth: "cache" would also skip plugins/foo/cache.
+func excludeArgs(excludes []string) []string {
+	args := make([]string, 0, len(excludes))
+	for _, ex := range excludes {
+		args = append(args, "--exclude=/"+strings.TrimPrefix(ex, "/"))
+	}
+	return args
+}
+
 // FileSync executes Step 2: rsync wp-content and fix ownership.
 func FileSync(livePath, stagePath string, excludes []string, log progress.Logger) error {
 	src := filepath.Join(livePath, "wp-content") + "/"
@@ -154,21 +193,19 @@ func FileSync(livePath, stagePath string, excludes []string, log progress.Logger
 
 	log.Detail(fmt.Sprintf("rsync %s → %s", src, dst))
 	args := []string{"-a", "--delete"}
-	for _, ex := range excludes {
-		args = append(args, "--exclude="+ex)
-	}
+	args = append(args, excludeArgs(excludes)...)
 	args = append(args, src, dst)
 	cmd := exec.Command("rsync", args...)
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("rsync: %w", err)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("rsync: %w", CommandError(err, out))
 	}
 
 	// Detect owner:group from staging webroot
 	uid, gid := detectOwnership(stagePath)
 	log.Detail(fmt.Sprintf("Fixing ownership to %d:%d", uid, gid))
 	chown := exec.Command("chown", "-R", fmt.Sprintf("%d:%d", uid, gid), dst)
-	if err := chown.Run(); err != nil {
-		return fmt.Errorf("chown: %w", err)
+	if out, err := chown.CombinedOutput(); err != nil {
+		return fmt.Errorf("chown: %w", CommandError(err, out))
 	}
 
 	return nil

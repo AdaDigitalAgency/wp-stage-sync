@@ -25,7 +25,8 @@ type Config struct {
 	OrderPreference string               `json:"order_preference"` // "last" or "first"
 	Anonymize       bool                 `json:"anonymize"`
 	TableModes      map[string]TableMode `json:"table_modes"`
-	RsyncExcludes   []string             `json:"rsync_excludes,omitempty"`
+	// RsyncExcludes: nil means use the defaults, empty means exclude nothing.
+	RsyncExcludes []string `json:"rsync_excludes"`
 }
 
 type Settings struct {

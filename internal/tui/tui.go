@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -83,6 +84,8 @@ type model struct {
 	allTables      []string
 	excludeItems   []string        // wp-content subfolders available for exclusion
 	excludeChecked map[string]bool // true = excluded from rsync
+	excludeErr     error           // wp-content could not be read
+	excludeTouched bool            // the user toggled an item in this step
 	cursor         int
 	input          string
 	err            error
@@ -557,6 +560,12 @@ func (m model) View() string {
 		case stepExcludes:
 			b.WriteString(promptStyle.Render("Rsync excludes (wp-content/):") + "\n")
 			b.WriteString(dimStyle.Render("Space to toggle, Enter to confirm, Esc to go back") + "\n\n")
+			if m.excludeErr != nil {
+				b.WriteString(selectedStyle.Render(fmt.Sprintf("Cannot read wp-content: %v", m.excludeErr)) + "\n\n")
+			}
+			if len(m.excludeItems) == 0 {
+				b.WriteString(dimStyle.Render("No folders to select. Enter keeps the current excludes.") + "\n")
+			}
 
 			// Viewport
 			visible := m.pageSize()
@@ -1617,17 +1626,18 @@ func (m model) updateTableSelect(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		m.cfg.TableModes[t] = cycleMode(m.cfg.TableModes[t])
 	case tea.KeyEnter:
-		m.excludeItems, m.excludeChecked = buildExcludeList(m.cfg)
+		m.excludeItems, m.excludeChecked, m.excludeErr = buildExcludeList(m.cfg)
+		m.excludeTouched = false
 		m.step = stepExcludes
 		m.cursor = 0
 	}
 	return m, nil
 }
 
-func buildExcludeList(cfg *config.Config) ([]string, map[string]bool) {
+func buildExcludeList(cfg *config.Config) ([]string, map[string]bool, error) {
 	// Scan wp-content for subdirectories
 	wpContentPath := filepath.Join(cfg.LivePath, "wp-content")
-	entries, _ := os.ReadDir(wpContentPath)
+	entries, err := os.ReadDir(wpContentPath)
 
 	var items []string
 	for _, e := range entries {
@@ -1638,10 +1648,15 @@ func buildExcludeList(cfg *config.Config) ([]string, map[string]bool) {
 
 	// Build checked map: start with defaults, then overlay saved config
 	checked := make(map[string]bool)
-	if len(cfg.RsyncExcludes) > 0 {
-		// Use saved excludes
+	if cfg.RsyncExcludes != nil {
+		// Use saved excludes. Keep the ones that are not wp-content subfolders
+		// (nested paths, removed folders) in the list, or Enter would drop them.
 		for _, ex := range cfg.RsyncExcludes {
-			checked[ex] = true
+			name := strings.Trim(ex, "/")
+			if !slices.Contains(items, name) {
+				items = append(items, name)
+			}
+			checked[name] = true
 		}
 	} else {
 		// Use defaults — only check items that actually exist
@@ -1655,11 +1670,18 @@ func buildExcludeList(cfg *config.Config) ([]string, map[string]bool) {
 		}
 	}
 
-	return items, checked
+	return items, checked, err
 }
 
 func (m model) updateExcludes(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	last := len(m.excludeItems) - 1
+	if last < 0 {
+		// Nothing to select: keep the saved excludes as they are.
+		if msg.Type == tea.KeyEnter {
+			m.step = stepConfirm
+		}
+		return m, nil
+	}
 	switch msg.Type {
 	case tea.KeyUp:
 		if m.cursor > 0 {
@@ -1686,9 +1708,17 @@ func (m model) updateExcludes(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case tea.KeySpace:
 		item := m.excludeItems[m.cursor]
 		m.excludeChecked[item] = !m.excludeChecked[item]
+		m.excludeTouched = true
 	case tea.KeyEnter:
+		// Without a choice, keep nil so the defaults still apply to folders
+		// that do not exist yet. Only a real toggle saves an explicit list.
+		if m.cfg.RsyncExcludes == nil && !m.excludeTouched {
+			m.step = stepConfirm
+			m.cursor = 0
+			return m, nil
+		}
 		// Save checked items to config
-		var excludes []string
+		excludes := []string{} // non-nil: "exclude nothing" is a valid choice
 		for _, item := range m.excludeItems {
 			if m.excludeChecked[item] {
 				excludes = append(excludes, item)
@@ -1780,7 +1810,7 @@ func runSync(cfg *config.Config, liveWP, stageWP *wpconfig.WPConfig, p *tea.Prog
 	}
 
 	log.Step("Syncing files")
-	if err := sync.FileSync(cfg.LivePath, cfg.StagePath, cfg.RsyncExcludes, log); err != nil {
+	if err := sync.FileSync(cfg.LivePath, cfg.StagePath, sync.ResolveExcludes(cfg.RsyncExcludes), log); err != nil {
 		return fmt.Errorf("file sync: %w", err)
 	}
 	log.StepDone("File sync complete")

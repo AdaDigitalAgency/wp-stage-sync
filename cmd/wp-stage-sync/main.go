@@ -318,10 +318,7 @@ func runUnattended(siteDomain string) error {
 
 	// Step 2: File sync
 	log.Step("Syncing files")
-	excludes := cfg.RsyncExcludes
-	if len(excludes) == 0 {
-		excludes = sync.DefaultExcludes
-	}
+	excludes := sync.ResolveExcludes(cfg.RsyncExcludes)
 	if err := sync.FileSync(cfg.LivePath, cfg.StagePath, excludes, log); err != nil {
 		return fmt.Errorf("file sync: %w", err)
 	}
@@ -404,10 +401,7 @@ func runDryRun(siteDomain string) error {
 
 	// Plan the file sync via rsync --dry-run.
 	log.Step("Planning file sync (rsync --dry-run)")
-	excludes := cfg.RsyncExcludes
-	if len(excludes) == 0 {
-		excludes = sync.DefaultExcludes
-	}
+	excludes := sync.ResolveExcludes(cfg.RsyncExcludes)
 	rsyncPlan, rsyncErr := sync.FileSyncPlan(cfg.LivePath, cfg.StagePath, excludes)
 	if rsyncErr != nil {
 		log.Detail(fmt.Sprintf("rsync preview unavailable: %v", rsyncErr))
