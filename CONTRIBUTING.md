@@ -31,11 +31,13 @@ internal/
 ├── guardrail/       Production safety checks (path + DB validation)
 ├── progress/        Logger interface (CLILogger, NopLogger)
 ├── selfupdate/      GitHub release update checker
+├── release/         Release tool logic: changelog cut, ship plan
 ├── sync/            File sync (rsync), post-processing (WP-CLI)
 ├── tui/             Bubbletea TUI (all interactive screens)
+├── whatsnew/        Release notes shown in the TUI
 ├── wpcli/           WP-CLI resolution and PHAR fallback
 └── wpconfig/        wp-config.php parser
-scripts/release.sh   Version bump, squash, tag, push
+cmd/release/         Release tool: checks, version bump, changelog, ship
 ```
 
 ## Development Workflow
@@ -70,6 +72,28 @@ ssh user@server wp-stage-sync
 2. **Keep commits focused.** One logical change per commit.
 3. **Test on a real server.** This tool touches live databases and files — there's no substitute for testing against actual WordPress installs.
 4. **Update the changelog.** Add your changes to the `[Unreleased]` section of [CHANGELOG.md](CHANGELOG.md) following [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) conventions.
+5. **Update What's new if users will notice.** Add one to three short lines under `"unreleased"` in [internal/whatsnew/entries.go](internal/whatsnew/entries.go). This is for the person using the TUI, not a copy of the changelog. Most patches need none.
+
+## Releasing
+
+Maintainers release from a clean `main`:
+
+```bash
+make release-minor   # or release-patch, release-major
+```
+
+The tool does these steps, in order:
+
+1. Refuses a dirty tree, a branch other than `main`, or an empty `[Unreleased]`.
+2. Runs gofmt, vet, tests and build.
+3. Bumps `.version`, dates the changelog section and renames the What's new `"unreleased"` key.
+4. Runs the same checks again, and restores the files if they fail.
+5. Commits only those three files as `Release vX.Y.Z`. It never squashes.
+6. Asks once, then pushes `main`, waits for CI, tags, pushes the tag and waits for the release workflow.
+
+Run `make ship` to resume after an interruption. It reads the real state and does only the remaining steps. Use `go run ./cmd/release minor --no-ship` to stop at the commit, and `go run ./cmd/release ship --dry-run` to print the steps.
+
+Test on a real server before you release. CI does not cover a real WordPress install.
 
 ## Pull Requests
 
