@@ -12,14 +12,14 @@ var scanDirs = []string{
 	"/home",
 	"/var/www",
 	"/srv/www",
-	"/var/www/vhosts",   // Plesk
-	"/usr/local/lsws",   // OpenLiteSpeed
+	"/var/www/vhosts", // Plesk
+	"/usr/local/lsws", // OpenLiteSpeed
 }
 var apacheConfDirs = []string{
 	"/etc/apache2/sites-enabled",
 	"/etc/apache2/sites-available",
-	"/etc/httpd/conf.d",             // RHEL/AlmaLinux/CentOS
-	"/etc/httpd/sites-enabled",      // custom RHEL setups
+	"/etc/httpd/conf.d",        // RHEL/AlmaLinux/CentOS
+	"/etc/httpd/sites-enabled", // custom RHEL setups
 }
 var nginxConfDirs = []string{
 	"/etc/nginx/sites-enabled",
