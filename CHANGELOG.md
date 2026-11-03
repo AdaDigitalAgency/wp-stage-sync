@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-03
+
 ### Added
 
 - Elementor CSS is regenerated, the LiteSpeed page cache is purged, and the WP Rocket cache folders are emptied on staging after a sync, when those plugins are installed. A failed purge is a warning.

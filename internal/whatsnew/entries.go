@@ -7,7 +7,7 @@ package whatsnew
 // Add lines under "unreleased" in the same commit as the work. The release tool
 // renames that key to the version.
 var Entries = map[string][]string{
-	"unreleased": {
+	"0.8.0": {
 		"Sync no longer purges live Cloudflare or object cache",
 		"Stage CDN keys and caches of 16 plugins cleared",
 		"Option to switch off a shared stage object cache",
