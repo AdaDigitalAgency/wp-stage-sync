@@ -210,7 +210,7 @@ internal/
 ├── config/config.go          JSON config persistence (~/.config/wp-stage-sync/sites/)
 ├── db/db.go                  DB connection (root socket → wp-config fallback)
 ├── discovery/                Apache2, Nginx, LiteSpeed vhost + filesystem auto-discovery
-├── export/export.go          Core export engine (orders, users, HPOS, base)
+├── export/export.go          Core export engine (orders in both stores, users, base)
 ├── guardrail/guardrail.go    Production safety checks (path, DB, wp-content)
 ├── promote/promote.go        Stage → live promote engine (backup, rsync, restore)
 ├── sync/                     Import, rsync, WP-CLI post-processing, cache and CDN cleanup

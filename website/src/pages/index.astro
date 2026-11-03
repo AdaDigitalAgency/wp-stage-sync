@@ -141,7 +141,7 @@ import Base from '../layouts/Base.astro';
 						</svg>
 					</div>
 					<h3>WooCommerce Order Filtering</h3>
-					<p>HPOS-aware. Exports only the N most recent (or oldest) orders — not your entire order history.
+					<p>Works with HPOS and legacy order storage. Exports only the N most recent (or oldest) orders — not your entire order history.
 						Keeps customer accounts only for those included orders.</p>
 				</div>
 				<div class="feature-card">
@@ -263,10 +263,11 @@ import Base from '../layouts/Base.astro';
 				<div class="step">
 					<div class="step-num">Step 0</div>
 					<h3>Database Export</h3>
-					<p>Queries live DB read-only. Filters HPOS order tables, excludes bulk session data.</p>
+					<p>Queries live DB read-only. Filters order tables in both order stores, excludes bulk session data.</p>
 					<ul>
 						<li>Target N orders from <code
-								style="font-family:'JetBrains Mono',monospace;font-size:11px">wc_orders</code></li>
+								style="font-family:'JetBrains Mono',monospace;font-size:11px">wc_orders</code> or <code
+								style="font-family:'JetBrains Mono',monospace;font-size:11px">wp_posts</code></li>
 						<li>Linked customers preserved</li>
 						<li>Structure-only export for specific tables</li>
 						<li>Custom rules for order related tables</li>
@@ -337,12 +338,14 @@ import Base from '../layouts/Base.astro';
 		<div class="container">
 			<div class="callout">
 				<div class="section-label" style="margin-bottom: 10px">WooCommerce</div>
-				<h3>Built for HPOS. Not compatible with legacy order storage.</h3>
-				<p>wp-stage-sync queries <code
+				<h3>HPOS or legacy order storage. Both are filtered.</h3>
+				<p>With HPOS, wp-stage-sync reads the target orders from <code
 						style="font-family:'JetBrains Mono',monospace;font-size:12px;background:rgba(0,115,170,0.08);padding:1px 6px;border-radius:3px">wc_orders</code>
-					directly and filters all HPOS lookup tables by order ID. Backwards compatibility mode (legacy <code
-						style="font-family:'JetBrains Mono',monospace;font-size:12px;background:rgba(0,115,170,0.08);padding:1px 6px;border-radius:3px">wp_posts</code>-based
-					order tables) is not supported.</p>
+					and filters every HPOS lookup table by order ID. With legacy storage, it reads them from <code
+						style="font-family:'JetBrains Mono',monospace;font-size:12px;background:rgba(0,115,170,0.08);padding:1px 6px;border-radius:3px">wp_posts</code>
+					and keeps only those orders and their meta. The order copies that HPOS compatibility mode keeps in
+					<code style="font-family:'JetBrains Mono',monospace;font-size:12px;background:rgba(0,115,170,0.08);padding:1px 6px;border-radius:3px">wp_posts</code>
+					are filtered too.</p>
 				<div class="pill-row">
 					<span class="pill">wc_orders</span>
 					<span class="pill">wc_order_addresses</span>
@@ -351,6 +354,8 @@ import Base from '../layouts/Base.astro';
 					<span class="pill">wc_order_product_lookup</span>
 					<span class="pill">wc_order_tax_lookup</span>
 					<span class="pill">wc_order_coupon_lookup</span>
+					<span class="pill">wp_posts</span>
+					<span class="pill">wp_postmeta</span>
 				</div>
 			</div>
 		</div>

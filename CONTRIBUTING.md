@@ -27,7 +27,7 @@ internal/
 ├── config/          JSON config persistence (~/.config/wp-stage-sync/)
 ├── db/              MySQL connection (socket fallback, IPv4 forcing)
 ├── discovery/       Apache/Nginx/LiteSpeed vhost scanning, site pairing
-├── export/          Table export engine (HPOS orders, batched INSERTs)
+├── export/          Table export engine (HPOS and legacy orders, batched INSERTs)
 ├── guardrail/       Production safety checks (path + DB validation)
 ├── progress/        Logger interface (CLILogger, NopLogger)
 ├── selfupdate/      GitHub release update checker
