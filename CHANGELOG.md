@@ -28,6 +28,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Site discovery reads LiteSpeed Enterprise's own XML config (`/usr/local/lsws/conf/httpd_config.xml`, including vhost templates) and OpenLiteSpeed's `httpd_config.conf`, and cPanel's `/etc/apache2/conf/httpd.conf`. Before, a site outside `/home`, `/var/www` and `/srv/www` on these servers was not listed.
 - The default rsync excludes also skip `boost-cache/cache`, `wphb-cache/cache`, `wphb-logs`, `wp-cloudflare-super-page-cache` and SQLite Object Cache database files.
 
+### Changed
+
+Read these before the first sync with this version.
+
+- **Some syncs now stop before any change.** A sync refuses to start when staging and live would share object cache keys (the probe key test), when Object Cache Pro on staging uses live's Redis database, when one webroot is inside the other, when live's `db-cluster-config.php` names live's database, or when a live setting the staging cleanup must change cannot be read. Run `wp-stage-sync -n -s <site>` first: the dry run shows the `[check]` lines and the warnings.
+- **WooCommerce subscriptions are no longer copied to staging.** Only the target orders and their refunds are exported, in both order stores.
+- **Sites on a generic webroot get a new name.** A webroot such as `/home/user/example.com/public_html` is now named `example.com`. A site already saved under its folder name keeps that name, with its configuration and backups.
+- **More folders are excluded by default:** `boost-cache/cache`, `wphb-cache/cache`, `wphb-logs`, `wp-cloudflare-super-page-cache` and SQLite Object Cache database files. A saved custom exclude list does not get them; add them in the TUI excludes step.
+- **The live cache flush after a promote or restore is scoped.** It deletes only live's keys, and it is skipped with a warning when the drop-in can only clear a whole shared server.
+- **Staging plugin settings change after each sync:** live's CDN, Cloudflare, firewall and QUIC.cloud credentials are cleared, and W3 Total Cache gets its own `instance_id`. To use those services on staging, connect staging to its own accounts.
+- **The website deploy builds the site with Node.js 24** (`npm ci`, `npm run build`) and uploads `website/dist/`.
+
 ### Fixed
 
 - **Customer data reached staging on shops without HPOS.** Order filtering read only the HPOS `wc_orders` table. On a shop that stores orders in `wp_posts`, every order and its billing and shipping meta was copied, and anonymisation did not touch them. Orders are now filtered in both stores, including the copies HPOS compatibility sync keeps in `wp_posts`, and anonymisation covers order postmeta, customer notes and the HPOS address search index. `wc_customer_lookup` and `woocommerce_downloadable_product_permissions` are filtered and anonymised too.
