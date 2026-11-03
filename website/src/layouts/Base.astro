@@ -1,6 +1,9 @@
 ---
 import '../styles/site.css';
 import '../styles/prose.css';
+// The version the site was built from: the repo's .version, which the
+// release tool sets in the release commit, so a deployed release shows it.
+import rawVersion from '../../../.version?raw';
 
 interface Props {
   title: string;
@@ -13,6 +16,7 @@ interface Props {
 const { title, description, path, current } = Astro.props;
 const base = import.meta.env.BASE_URL.replace(/\/?$/, '/');
 const url = new URL(base + path, Astro.site).href;
+const version = rawVersion.trim();
 ---
 <!DOCTYPE html>
 <html lang="en" data-theme="light">
@@ -45,6 +49,7 @@ const url = new URL(base + path, Astro.site).href;
 	<!-- NAV -->
 	<nav>
 		<div class="nav-inner">
+			<div class="nav-brand">
 			<a href={base} class="nav-logo">
 				<svg width="22" height="22" viewBox="0 0 22 22" fill="none" xmlns="http://www.w3.org/2000/svg">
 					<rect width="22" height="22" rx="5" fill="#0073AA" />
@@ -53,6 +58,9 @@ const url = new URL(base + path, Astro.site).href;
 				</svg>
 				wp-stage-sync
 			</a>
+			<a class="nav-version" href="https://github.com/AdaDigitalAgency/wp-stage-sync/blob/main/CHANGELOG.md"
+				aria-label={`Version ${version}: what changed`}>v{version}</a>
+			</div>
 			<div class="nav-right">
 				<a href={`${base}docs/`} class="nav-link" aria-current={current === "docs" ? "page" : undefined}>Docs</a>
 				<a href="https://github.com/AdaDigitalAgency/wp-stage-sync" target="_blank" rel="noopener"
