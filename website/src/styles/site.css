@@ -52,6 +52,9 @@
 
 html {
 	scroll-behavior: smooth;
+	/* Anchor jumps (#section, docs headings) stop below the sticky nav:
+	   60px bar, 1px border, and room to breathe. */
+	scroll-padding-top: 80px;
 }
 
 body {
@@ -235,7 +238,6 @@ nav {
 	max-width: 600px;
 	margin: -16px auto 36px;
 	text-align: left;
-	scroll-margin-top: 75px;
 }
 
 .trust-note-text {
