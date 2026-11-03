@@ -30,6 +30,8 @@ const (
 	entriesFile   = "internal/whatsnew/entries.go"
 	envFile       = ".env"
 	websiteDir    = "website/"
+	websiteDist   = "website/dist/"
+	docsDir       = "docs/"
 	userAgent     = "ada-claude-code/1.0 (+ada.agency)"
 
 	pollInterval = 15 * time.Second
@@ -104,12 +106,16 @@ func shipAndOfferWebsite(yes, dryRun, website bool) error {
 // deployWebsite compares website/ with the server and publishes the changes.
 // It never uses --delete: the server folder is not rebuilt from this repo.
 func deployWebsite(publish bool) error {
-	dirty, err := output("git", "status", "--porcelain", "--", websiteDir)
+	// The site is built from website/ and the docs pages from docs/.
+	dirty, err := output("git", "status", "--porcelain", "--", websiteDir, docsDir)
 	if err != nil {
 		return err
 	}
 	if dirty != "" {
-		return fmt.Errorf("website/ has uncommitted changes:\n%s", dirty)
+		return fmt.Errorf("website/ or docs/ has uncommitted changes:\n%s", dirty)
+	}
+	if err := buildWebsite(); err != nil {
+		return fmt.Errorf("building the website: %w", err)
 	}
 	env, err := os.ReadFile(envFile)
 	if err != nil {
@@ -122,7 +128,7 @@ func deployWebsite(publish bool) error {
 	dest := target + ":" + release.WebsiteRoot + "/"
 	args := []string{"-rlptD", "--checksum", "--exclude=.DS_Store"}
 
-	plan, err := output("rsync", append(append([]string{}, args...), "--dry-run", "--itemize-changes", websiteDir, dest)...)
+	plan, err := output("rsync", append(append([]string{}, args...), "--dry-run", "--itemize-changes", websiteDist, dest)...)
 	if err != nil {
 		return err
 	}
@@ -140,7 +146,7 @@ func deployWebsite(publish bool) error {
 		return verifyWebsite()
 	}
 	if len(changed) > 0 {
-		if err := exec1("rsync", append(args, websiteDir, dest)...); err != nil {
+		if err := exec1("rsync", append(args, websiteDist, dest)...); err != nil {
 			return err
 		}
 		// macOS openrsync ignores --chmod, so the server step sets the modes.
@@ -154,9 +160,27 @@ func deployWebsite(publish bool) error {
 	return verifyWebsite()
 }
 
-// verifyWebsite compares the live page with the local file.
+// buildWebsite installs the locked dependencies and builds the Astro site
+// into website/dist/. `astro check` runs first, so a broken page or doc stops
+// the deploy.
+func buildWebsite() error {
+	for _, args := range [][]string{
+		{"ci", "--no-fund", "--no-audit", "--user-agent=" + userAgent},
+		{"run", "build"},
+	} {
+		cmd := exec.Command("npm", args...)
+		cmd.Dir = websiteDir
+		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("npm %s: %w", args[0], err)
+		}
+	}
+	return nil
+}
+
+// verifyWebsite compares the live page with the built file.
 func verifyWebsite() error {
-	local, err := os.ReadFile(websiteDir + "index.html")
+	local, err := os.ReadFile(websiteDist + "index.html")
 	if err != nil {
 		return err
 	}
@@ -179,9 +203,9 @@ func verifyWebsite() error {
 		return fmt.Errorf("%s returned %d", release.WebsiteURL, resp.StatusCode)
 	}
 	if sha256.Sum256(live) != sha256.Sum256(local) {
-		return fmt.Errorf("%s does not match website/index.html", release.WebsiteURL)
+		return fmt.Errorf("%s does not match website/dist/index.html", release.WebsiteURL)
 	}
-	fmt.Printf("✓ %s matches website/index.html\n", release.WebsiteURL)
+	fmt.Printf("✓ %s matches website/dist/index.html\n", release.WebsiteURL)
 	return nil
 }
 

@@ -26,7 +26,7 @@ cmd/wp-stage-sync/   Entry point (CLI flags, unattended mode)
 internal/
 ├── config/          JSON config persistence (~/.config/wp-stage-sync/)
 ├── db/              MySQL connection (socket fallback, IPv4 forcing)
-├── discovery/       Apache/Nginx vhost scanning, site pairing
+├── discovery/       Apache/Nginx/LiteSpeed vhost scanning, site pairing
 ├── export/          Table export engine (HPOS orders, batched INSERTs)
 ├── guardrail/       Production safety checks (path + DB validation)
 ├── progress/        Logger interface (CLILogger, NopLogger)
@@ -38,6 +38,8 @@ internal/
 ├── wpcli/           WP-CLI resolution and PHAR fallback
 └── wpconfig/        wp-config.php parser
 cmd/release/         Release tool: checks, version bump, changelog, ship
+docs/                User documentation, rendered as the website's docs pages
+website/             Astro site (landing page, docs, llms.txt)
 ```
 
 ## Development Workflow
@@ -72,7 +74,8 @@ ssh user@server wp-stage-sync
 2. **Keep commits focused.** One logical change per commit.
 3. **Test on a real server.** This tool touches live databases and files — there's no substitute for testing against actual WordPress installs.
 4. **Update the changelog.** Add your changes to the `[Unreleased]` section of [CHANGELOG.md](CHANGELOG.md) following [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) conventions.
-5. **Update What's new if users will notice.** Add one to three short lines under `"unreleased"` in [internal/whatsnew/entries.go](internal/whatsnew/entries.go). This is for the person using the TUI, not a copy of the changelog. Most patches need none.
+5. **Update the docs.** If behaviour changes, change the page in `docs/` that describes it. The same file is the website page.
+6. **Update What's new if users will notice.** Add one to three short lines under `"unreleased"` in [internal/whatsnew/entries.go](internal/whatsnew/entries.go). This is for the person using the TUI, not a copy of the changelog. Most patches need none.
 
 ## Releasing
 
@@ -100,7 +103,16 @@ make deploy-website        # dry run: lists the files that differ
 make deploy-website GO=1   # publishes them and checks the live page
 ```
 
-The website deploy needs `.env` (see `.env.example`). It refuses uncommitted changes in `website/`, never uses `--delete`, and writes only to the path pinned in `internal/release/website.go`. A website failure does not affect a shipped release.
+The website is an Astro project in `website/`. Its docs pages are built from `docs/*.md`, read in place, so every doc change is also a site change. To work on it:
+
+```bash
+cd website
+npm ci
+npm run dev      # http://localhost:4321/wp-stage-sync/
+npm run build    # astro check, then the static site in website/dist/
+```
+
+The website deploy needs `.env` (see `.env.example`) and Node.js 24. It refuses uncommitted changes in `website/` or `docs/`, runs `npm ci` and `npm run build`, uploads `website/dist/`, never uses `--delete`, and writes only to the path pinned in `internal/release/website.go`. A website failure does not affect a shipped release. CI builds the site on every push, so a broken doc fails CI.
 
 Test on a real server before you release. CI does not cover a real WordPress install.
 

@@ -1,0 +1,38 @@
+---
+import Base from './Base.astro';
+import { allDocs } from '../lib/docs';
+
+interface Props {
+  title: string;
+  description: string;
+  path: string;
+  /** Slug of the current page, for the navigation. */
+  current: string;
+  /** Where the page's source lives in the repo, for the edit link. */
+  source?: string;
+}
+const { title, description, path, current, source } = Astro.props;
+const base = import.meta.env.BASE_URL.replace(/\/?$/, '/');
+const docs = await allDocs();
+---
+<Base title={`${title} · wp-stage-sync`} description={description} path={path} current="docs">
+  <div class="container doc">
+    <aside class="doc-side" aria-label="Documentation">
+      <p class="doc-side-title"><a href={`${base}docs/`}>Docs</a></p>
+      <ul>
+        {docs.map((d) => (
+          <li><a href={`${base}docs/${d.slug}/`} aria-current={d.slug === current ? 'page' : undefined}>{d.title}</a></li>
+        ))}
+      </ul>
+    </aside>
+    <article class="prose">
+      <h1>{title}</h1>
+      <slot />
+      {source && (
+        <p class="doc-edit">
+          This page is <a href={`https://github.com/AdaDigitalAgency/wp-stage-sync/blob/main/${source}`}>{source}</a> in the repository.
+        </p>
+      )}
+    </article>
+  </div>
+</Base>

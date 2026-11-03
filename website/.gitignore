@@ -1,0 +1,4 @@
+# Astro's generated types and caches, the build output and dependencies.
+.astro/
+dist/
+node_modules/

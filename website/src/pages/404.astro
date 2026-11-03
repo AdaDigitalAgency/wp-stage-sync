@@ -1,0 +1,10 @@
+---
+import Base from '../layouts/Base.astro';
+const base = import.meta.env.BASE_URL.replace(/\/?$/, '/');
+---
+<Base title="Page not found · wp-stage-sync" description="This page does not exist." path="404/">
+  <div class="container prose" style="padding: 80px 24px">
+    <h1>Page not found</h1>
+    <p>Go to the <a href={base}>home page</a> or the <a href={`${base}docs/`}>docs</a>.</p>
+  </div>
+</Base>

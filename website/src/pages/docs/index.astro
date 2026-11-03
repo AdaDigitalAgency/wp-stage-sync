@@ -1,0 +1,18 @@
+---
+import Doc from '../../layouts/Doc.astro';
+import { allDocs } from '../../lib/docs';
+
+const base = import.meta.env.BASE_URL.replace(/\/?$/, '/');
+const docs = await allDocs();
+---
+<Doc title="Documentation" description="How to install, configure and run wp-stage-sync: the TUI, unattended runs, cache plugins, object cache, server support and safety." path="docs/" current="">
+  <p class="lede">Everything wp-stage-sync does, one page per topic. The same pages are in the repository's <code>docs/</code> folder.</p>
+  <ul class="doc-cards">
+    {docs.map((d) => (
+      <li>
+        <a href={`${base}docs/${d.slug}/`}><strong>{d.title}</strong></a>
+        <span>{d.description}</span>
+      </li>
+    ))}
+  </ul>
+</Doc>
