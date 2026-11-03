@@ -13,13 +13,15 @@ var scanDirs = []string{
 	"/var/www",
 	"/srv/www",
 	"/var/www/vhosts", // Plesk
-	"/usr/local/lsws", // OpenLiteSpeed
+	"/usr/local/lsws", // LiteSpeed default vhost roots
 }
 var apacheConfDirs = []string{
 	"/etc/apache2/sites-enabled",
 	"/etc/apache2/sites-available",
 	"/etc/httpd/conf.d",        // RHEL/AlmaLinux/CentOS
 	"/etc/httpd/sites-enabled", // custom RHEL setups
+	"/etc/apache2/conf",        // cPanel EasyApache 4 (httpd.conf holds every vhost)
+	"/etc/apache2/conf.d",      // Debian/Ubuntu extra configs, cPanel includes
 }
 var nginxConfDirs = []string{
 	"/etc/nginx/sites-enabled",
@@ -64,7 +66,12 @@ func Scan() []string {
 		addRoot(vhost.DocumentRoot)
 	}
 
-	// 3. Filesystem scan as fallback
+	// 3. Parse LiteSpeed vhosts (Enterprise native XML, OpenLiteSpeed)
+	for _, vhost := range ScanLiteSpeedVHosts() {
+		addRoot(vhost.DocumentRoot)
+	}
+
+	// 4. Filesystem scan as fallback
 	for _, dir := range scanDirs {
 		filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
 			if err != nil {
@@ -224,12 +231,29 @@ func parseNginxConf(path string) []VHost {
 	return vhosts
 }
 
-// ExtractDomain extracts the domain from a webroot path.
-// /home/example.com/ → example.com
-// /home/stage.example.com/ → stage.example.com
+// genericWebroots are folder names that say nothing about the site. A
+// webroot with one of these names is named after its parent folder.
+var genericWebroots = map[string]bool{
+	"public_html": true, "htdocs": true, "httpdocs": true, "html": true, "www": true,
+	"web": true, "public": true, "wordpress": true, "current": true,
+}
+
+// ExtractDomain names a site after its webroot path:
+// /home/example.com/ → example.com, /home/stage.example.com/ → stage.example.com,
+// /var/www/vhosts/example.com/httpdocs → example.com (generic folder names
+// are skipped upward).
 func ExtractDomain(webroot string) string {
-	webroot = strings.TrimRight(webroot, "/")
-	return filepath.Base(webroot)
+	p := filepath.Clean(strings.TrimRight(webroot, "/"))
+	name := filepath.Base(p)
+	for genericWebroots[strings.ToLower(name)] {
+		parent := filepath.Dir(p)
+		if parent == p || parent == "/" || parent == "." {
+			break
+		}
+		p = parent
+		name = filepath.Base(p)
+	}
+	return name
 }
 
 // SitePair is an auto-detected live+stage pair.

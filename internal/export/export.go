@@ -1,6 +1,7 @@
 package export
 
 import (
+	"context"
 	"database/sql"
 	"encoding/hex"
 	"fmt"
@@ -10,6 +11,12 @@ import (
 	"github.com/AdaDigitalAgency/wp-stage-sync/internal/config"
 	"github.com/AdaDigitalAgency/wp-stage-sync/internal/progress"
 )
+
+// querier is *sql.DB or *sql.Tx: Run reads inside one transaction.
+type querier interface {
+	Query(query string, args ...any) (*sql.Rows, error)
+	QueryRow(query string, args ...any) *sql.Row
+}
 
 // Result holds all generated SQL grouped by category.
 type Result struct {
@@ -41,7 +48,13 @@ var customOrderTables = map[string]string{
 	"wc_order_tax_lookup":       "order_id",
 	"wc_order_coupon_lookup":    "order_id",
 	"woocommerce_order_items":   "order_id",
+	// Holds the customer's e-mail for every download permission.
+	"woocommerce_downloadable_product_permissions": "order_id",
 }
+
+// orderPostTypes are the WooCommerce order types stored as posts: the legacy
+// order store, and the copies HPOS keeps when compatibility sync is on.
+var orderPostTypes = []string{"shop_order", "shop_order_refund", "shop_order_placehold", "shop_subscription"}
 
 // customRuleTables are handled with special filtering logic.
 var customRuleTables = map[string]bool{
@@ -97,6 +110,7 @@ type tableAction struct {
 // counts plus the ordered list of table actions.
 type classification struct {
 	hasWoo       bool
+	hpos         bool // orders are read from wc_orders, not from posts
 	orderCount   int
 	orderPref    string
 	targetOrders int
@@ -108,7 +122,7 @@ type classification struct {
 // classify inspects the live database and produces the ordered set of table
 // actions — the one place that decides which tables are filtered, schema-only,
 // or full. Run and BuildPlan both walk this list so they can never drift.
-func classify(db *sql.DB, prefix string, cfg *config.Config, log progress.Logger) (*classification, error) {
+func classify(db querier, prefix string, cfg *config.Config, log progress.Logger) (*classification, error) {
 	allTables, err := listTables(db)
 	if err != nil {
 		return nil, fmt.Errorf("listing tables: %w", err)
@@ -126,14 +140,19 @@ func classify(db *sql.DB, prefix string, cfg *config.Config, log progress.Logger
 		totalTables: len(allTables),
 	}
 
-	// No wc_orders means no WooCommerce: skip order/user/comment filtering and
-	// export every table in full.
-	c.hasWoo = tableSet[prefix+"wc_orders"]
+	// WooCommerce has order item tables in both order stores. Without them,
+	// skip order/user/comment filtering and export every table in full.
+	c.hasWoo = tableSet[prefix+"wc_orders"] || tableSet[prefix+"woocommerce_order_items"]
 
 	var orderIDs, userIDs []int64
 	if c.hasWoo {
-		log.Detail(fmt.Sprintf("Querying target orders (%s %d)", cfg.OrderPreference, cfg.OrderCount))
-		orderIDs, err = getTargetOrderIDs(db, prefix, cfg.OrderCount, cfg.OrderPreference)
+		c.hpos = tableSet[prefix+"wc_orders"] && hposAuthoritative(db, prefix)
+		store := "posts (legacy order store)"
+		if c.hpos {
+			store = "wc_orders (HPOS)"
+		}
+		log.Detail(fmt.Sprintf("Querying target orders (%s %d) from %s", cfg.OrderPreference, cfg.OrderCount, store))
+		orderIDs, err = getTargetOrderIDs(db, prefix, cfg.OrderCount, cfg.OrderPreference, c.hpos)
 		if err != nil {
 			return nil, fmt.Errorf("target orders: %w", err)
 		}
@@ -141,7 +160,7 @@ func classify(db *sql.DB, prefix string, cfg *config.Config, log progress.Logger
 		log.Detail(fmt.Sprintf("Found %d orders", len(orderIDs)))
 
 		log.Detail("Resolving safe user set")
-		userIDs, err = getSafeUserIDs(db, prefix, orderIDs)
+		userIDs, err = getSafeUserIDs(db, prefix, orderIDs, c.hpos)
 		if err != nil {
 			return nil, fmt.Errorf("safe users: %w", err)
 		}
@@ -225,6 +244,38 @@ func classify(db *sql.DB, prefix string, cfg *config.Config, log progress.Logger
 			filter: fmt.Sprintf("user_id IN (%d safe users)", len(userIDs)),
 		})
 
+		// Orders stored as posts (legacy store, or HPOS sync copies): only the
+		// target orders and their meta. Other posts are copied in full.
+		// A table the user set to ignore or structure-only keeps that mode.
+		postsTable, postmetaTable := prefix+"posts", prefix+"postmeta"
+		if tableSet[postsTable] && getTableMode(cfg, postsTable, prefix) == config.TableModeStructureAndData {
+			where, args := postsFilter(orderIDs)
+			add(tableAction{
+				name: postsTable, bucket: bucketOrders, dump: true, mode: config.TableModeCustomRule,
+				where: where, args: args,
+				filter: fmt.Sprintf("all posts except orders; %d target orders", len(orderIDs)),
+			})
+		}
+		if tableSet[postmetaTable] && tableSet[postsTable] && getTableMode(cfg, postmetaTable, prefix) == config.TableModeStructureAndData {
+			where, args := postmetaFilter(postsTable, orderIDs)
+			add(tableAction{
+				name: postmetaTable, bucket: bucketOrders, dump: true, mode: config.TableModeCustomRule,
+				where: where, args: args,
+				filter: "meta of the above posts",
+			})
+		}
+
+		// Analytics customer table: every customer's name, e-mail and
+		// address. Keep the customers of the target orders and safe users.
+		if lookup := prefix + "wc_customer_lookup"; tableSet[lookup] {
+			where, args := customerLookupFilter(prefix, tableSet[prefix+"wc_order_stats"], orderIDs, userIDs)
+			add(tableAction{
+				name: lookup, bucket: bucketOrders, dump: true, mode: config.TableModeCustomRule,
+				where: where, args: args,
+				filter: "customers of the target orders and safe users",
+			})
+		}
+
 		// YITH points log, filtered by order OR user.
 		if yith := prefix + "yith_ywpar_points_log"; tableSet[yith] {
 			where, args := orderOrUserFilter(orderIDs, userIDs)
@@ -297,7 +348,18 @@ func (res *Result) append(b bucket, stmts ...string) {
 	}
 }
 
-func Run(liveDB *sql.DB, prefix string, cfg *config.Config, log progress.Logger) (*Result, error) {
+func Run(db *sql.DB, prefix string, cfg *config.Config, log progress.Logger) (*Result, error) {
+	// One read-only REPEATABLE READ transaction: every query sees the same
+	// snapshot, so an order, its items and its customer come from one moment
+	// on a busy shop (InnoDB tables). READ ONLY also makes the server refuse
+	// any write on this connection.
+	tx, err := db.BeginTx(context.Background(), &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true})
+	if err != nil {
+		return nil, fmt.Errorf("starting a read-only snapshot on live: %w", err)
+	}
+	defer tx.Rollback()
+	liveDB := tx
+
 	c, err := classify(liveDB, prefix, cfg, log)
 	if err != nil {
 		return nil, err
@@ -345,18 +407,50 @@ func getTableMode(cfg *config.Config, table, prefix string) config.TableMode {
 	return config.TableModeStructureAndData
 }
 
-func getTargetOrderIDs(db *sql.DB, prefix string, count int, pref string) ([]int64, error) {
+// hposAuthoritative reports whether WooCommerce reads orders from wc_orders.
+// With HPOS off, wc_orders can exist (sync, or a switch back) while posts hold
+// the orders.
+func hposAuthoritative(db querier, prefix string) bool {
+	var v string
+	q := fmt.Sprintf("SELECT option_value FROM `%soptions` WHERE option_name = 'woocommerce_custom_orders_table_enabled'", prefix)
+	if err := db.QueryRow(q).Scan(&v); err != nil {
+		return false
+	}
+	return v == "yes"
+}
+
+// getTargetOrderIDs returns the newest (or oldest) count orders and their
+// refunds, from wc_orders with HPOS or from posts otherwise.
+func getTargetOrderIDs(db querier, prefix string, count int, pref string, hpos bool) ([]int64, error) {
 	order := "DESC"
 	if pref == "first" {
 		order = "ASC"
 	}
-	query := fmt.Sprintf("SELECT id FROM %swc_orders ORDER BY id %s LIMIT ?", prefix, order)
-	rows, err := db.Query(query, count)
+	var orders, refunds string
+	if hpos {
+		orders = fmt.Sprintf("SELECT id FROM `%swc_orders` WHERE type = 'shop_order' ORDER BY id %s LIMIT ?", prefix, order)
+		refunds = fmt.Sprintf("SELECT id FROM `%swc_orders` WHERE type = 'shop_order_refund' AND parent_order_id IN (%%s)", prefix)
+	} else {
+		orders = fmt.Sprintf("SELECT ID FROM `%sposts` WHERE post_type = 'shop_order' ORDER BY ID %s LIMIT ?", prefix, order)
+		refunds = fmt.Sprintf("SELECT ID FROM `%sposts` WHERE post_type = 'shop_order_refund' AND post_parent IN (%%s)", prefix)
+	}
+	ids, err := queryIDs(db, orders, count)
+	if err != nil || len(ids) == 0 {
+		return ids, err
+	}
+	more, err := queryIDs(db, fmt.Sprintf(refunds, makeInPlaceholders(len(ids))), int64sToArgs(ids)...)
+	if err != nil {
+		return nil, fmt.Errorf("refunds: %w", err)
+	}
+	return append(ids, more...), nil
+}
+
+func queryIDs(db querier, query string, args ...interface{}) ([]int64, error) {
+	rows, err := db.Query(query, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-
 	var ids []int64
 	for rows.Next() {
 		var id int64
@@ -368,7 +462,50 @@ func getTargetOrderIDs(db *sql.DB, prefix string, count int, pref string) ([]int
 	return ids, rows.Err()
 }
 
-func getSafeUserIDs(db *sql.DB, prefix string, orderIDs []int64) ([]int64, error) {
+// orderTypesSQL is the quoted list of orderPostTypes.
+func orderTypesSQL() string {
+	return "'" + strings.Join(orderPostTypes, "','") + "'"
+}
+
+// postsFilter keeps every post that is not an order, and the target orders.
+func postsFilter(orderIDs []int64) (string, []interface{}) {
+	where := fmt.Sprintf("post_type NOT IN (%s)", orderTypesSQL())
+	if len(orderIDs) == 0 {
+		return where, nil
+	}
+	return fmt.Sprintf("%s OR ID IN (%s)", where, makeInPlaceholders(len(orderIDs))), int64sToArgs(orderIDs)
+}
+
+// postmetaFilter drops the meta of every order post that is not a target.
+func postmetaFilter(postsTable string, orderIDs []int64) (string, []interface{}) {
+	keep := ""
+	if len(orderIDs) > 0 {
+		keep = fmt.Sprintf(" AND ID NOT IN (%s)", makeInPlaceholders(len(orderIDs)))
+	}
+	where := fmt.Sprintf("post_id NOT IN (SELECT ID FROM `%s` WHERE post_type IN (%s)%s)", postsTable, orderTypesSQL(), keep)
+	return where, int64sToArgs(orderIDs)
+}
+
+// customerLookupFilter keeps the analytics customers of the target orders
+// and the exported users.
+func customerLookupFilter(prefix string, hasStats bool, orderIDs, userIDs []int64) (string, []interface{}) {
+	var parts []string
+	var args []interface{}
+	if hasStats && len(orderIDs) > 0 {
+		parts = append(parts, fmt.Sprintf("customer_id IN (SELECT customer_id FROM `%swc_order_stats` WHERE order_id IN (%s))", prefix, makeInPlaceholders(len(orderIDs))))
+		args = append(args, int64sToArgs(orderIDs)...)
+	}
+	if len(userIDs) > 0 {
+		parts = append(parts, fmt.Sprintf("user_id IN (%s)", makeInPlaceholders(len(userIDs))))
+		args = append(args, int64sToArgs(userIDs)...)
+	}
+	if len(parts) == 0 {
+		return "0", nil
+	}
+	return strings.Join(parts, " OR "), args
+}
+
+func getSafeUserIDs(db querier, prefix string, orderIDs []int64, hpos bool) ([]int64, error) {
 	userSet := make(map[int64]bool)
 
 	// Set A: all non-customer users
@@ -421,6 +558,12 @@ func getSafeUserIDs(db *sql.DB, prefix string, orderIDs []int64) ([]int64, error
 			"SELECT DISTINCT customer_id FROM %swc_orders WHERE id IN (%s) AND customer_id > 0",
 			prefix, placeholders,
 		)
+		if !hpos {
+			query = fmt.Sprintf(
+				"SELECT DISTINCT CAST(meta_value AS UNSIGNED) FROM `%spostmeta` WHERE meta_key = '_customer_user' AND post_id IN (%s) AND meta_value > 0",
+				prefix, placeholders,
+			)
+		}
 		args := int64sToArgs(orderIDs)
 		rows, err := db.Query(query, args...)
 		if err != nil {
@@ -446,7 +589,7 @@ func getSafeUserIDs(db *sql.DB, prefix string, orderIDs []int64) ([]int64, error
 	return ids, nil
 }
 
-func listTables(db *sql.DB) ([]string, error) {
+func listTables(db querier) ([]string, error) {
 	rows, err := db.Query("SHOW TABLES")
 	if err != nil {
 		return nil, err
@@ -463,7 +606,7 @@ func listTables(db *sql.DB) ([]string, error) {
 	return tables, rows.Err()
 }
 
-func getCreateTable(db *sql.DB, table string) (string, error) {
+func getCreateTable(db querier, table string) (string, error) {
 	var name, ddl string
 	err := db.QueryRow(fmt.Sprintf("SHOW CREATE TABLE `%s`", table)).Scan(&name, &ddl)
 	if err != nil {
@@ -476,7 +619,7 @@ func getCreateTable(db *sql.DB, table string) (string, error) {
 // (virtual/stored) columns — those can't be inserted into. Falls back to "*" if
 // the columns can't be determined (e.g. on a server without generated-column
 // support, which also can't have any).
-func selectExpr(db *sql.DB, table string) string {
+func selectExpr(db querier, table string) string {
 	rows, err := db.Query(`
 		SELECT COLUMN_NAME FROM information_schema.COLUMNS
 		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?
@@ -503,7 +646,7 @@ func selectExpr(db *sql.DB, table string) string {
 
 // dumpWhere dumps a table's rows (non-generated columns only), optionally
 // filtered by a WHERE clause; an empty where dumps the whole table.
-func dumpWhere(db *sql.DB, table, where string, args []interface{}) ([]string, error) {
+func dumpWhere(db querier, table, where string, args []interface{}) ([]string, error) {
 	query := fmt.Sprintf("SELECT %s FROM `%s`", selectExpr(db, table), table)
 	if where != "" {
 		query += " WHERE " + where
@@ -511,7 +654,7 @@ func dumpWhere(db *sql.DB, table, where string, args []interface{}) ([]string, e
 	return dumpRows(db, table, query, args)
 }
 
-func dumpRows(db *sql.DB, table, query string, args []interface{}) ([]string, error) {
+func dumpRows(db querier, table, query string, args []interface{}) ([]string, error) {
 	rows, err := db.Query(query, args...)
 	if err != nil {
 		return nil, err
@@ -621,7 +764,7 @@ func int64sToArgs(ids []int64) []interface{} {
 	return args
 }
 
-func getOrderItemIDs(db *sql.DB, prefix string, orderIDs []int64) ([]int64, error) {
+func getOrderItemIDs(db querier, prefix string, orderIDs []int64) ([]int64, error) {
 	if len(orderIDs) == 0 {
 		return nil, nil
 	}

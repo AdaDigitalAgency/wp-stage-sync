@@ -25,7 +25,7 @@ var version = "dev"
 
 func main() {
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "WP Stage Sync - Safely synchronize WordPress staging to live environments.\n\n")
+		fmt.Fprintf(os.Stderr, "WP Stage Sync - Sync a live WordPress site to its staging site, or promote\nthemes and plugins from staging to live.\n\n")
 		fmt.Fprintf(os.Stderr, "Usage: wp-stage-sync [flags]\n\n")
 		fmt.Fprintf(os.Stderr, "Flags:\n")
 		fmt.Fprintf(os.Stderr, "  -h, --help       Print this help message\n")
@@ -33,8 +33,8 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  --update         Update to the latest version\n")
 		fmt.Fprintf(os.Stderr, "  -u, --unattended Run in unattended mode using saved config\n")
 		fmt.Fprintf(os.Stderr, "  -n, --dry-run    Plan the sync and print what would change, without writing\n")
-		fmt.Fprintf(os.Stderr, "  --promote        Enter promote mode (stage → live)\n")
-		fmt.Fprintf(os.Stderr, "  --restore        Enter restore mode\n")
+		fmt.Fprintf(os.Stderr, "  --promote        Open the TUI in promote mode (stage → live)\n")
+		fmt.Fprintf(os.Stderr, "  --restore        Open the TUI in restore mode\n")
 		fmt.Fprintf(os.Stderr, "  -s, --site <id>  Target a specific site by identifier\n")
 		fmt.Fprintf(os.Stderr, "  -l, --list       List all configured sites\n")
 		fmt.Fprintf(os.Stderr, "  --delete         Delete a site config (requires --site)\n")
@@ -44,7 +44,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  wp-stage-sync -l                     # List all configured sites\n")
 		fmt.Fprintf(os.Stderr, "  wp-stage-sync -u -s my-site          # Sync 'my-site' unattended\n")
 		fmt.Fprintf(os.Stderr, "  wp-stage-sync -n -s my-site          # Preview the sync for 'my-site' (no changes)\n")
-		fmt.Fprintf(os.Stderr, "  wp-stage-sync --promote -s my-site   # Promote 'my-site' in unattended mode\n")
+		fmt.Fprintf(os.Stderr, "  wp-stage-sync --promote -s my-site   # Open the TUI in promote mode for 'my-site'\n")
 		fmt.Fprintf(os.Stderr, "  wp-stage-sync --delete -s my-site    # Delete 'my-site' configuration\n")
 		fmt.Fprintf(os.Stderr, "  wp-stage-sync --reset                # Wipe all configurations\n")
 	}
@@ -267,6 +267,13 @@ func runUnattended(siteDomain string) error {
 
 	// Safety: ensure live ≠ stage
 	log.Step("Validating paths and databases")
+	// One run per site at a time: a second sync, promote or restore would
+	// write the same files and database.
+	unlock, err := config.LockPaths(cfg.LivePath, cfg.StagePath)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	if err := guardrail.ValidatePaths(cfg.LivePath, cfg.StagePath); err != nil {
 		return err
 	}
@@ -290,7 +297,26 @@ func runUnattended(siteDomain string) error {
 
 	// Capture the real site hosts before import wipes the stage database.
 	liveHost := sync.SiteHost(liveDB, liveWP.TablePrefix, discovery.ExtractDomain(cfg.LivePath))
-	stageHost := sync.SiteHost(stageDB, stageWP.TablePrefix, discovery.ExtractDomain(cfg.StagePath))
+	stageHost, err := sync.StageHost(stageDB, stageWP.TablePrefix, cfg.StagePath, liveHost)
+	if err != nil {
+		return err
+	}
+
+	// Before anything on stage changes: refuse if stage would share live's
+	// object cache.
+	log.Step("Checking object cache isolation")
+	if err := sync.PreflightIntegrations(cfg.LivePath, cfg.StagePath, log); err != nil {
+		return err
+	}
+	// Before anything on stage changes: every live setting that the stage
+	// cleanup rewrites must be readable.
+	if err := sync.CheckNeutralize(liveDB, liveWP.TablePrefix, cfg.LivePath, cfg.StagePath, liveHost, stageHost, cfg.StageObjectCacheOff); err != nil {
+		return err
+	}
+	if err := sync.PreflightObjectCache(cfg.LivePath, cfg.StagePath, cfg.StageObjectCacheOff, log); err != nil {
+		return err
+	}
+	log.StepDone("Object cache check passed")
 
 	// Step 0: Export
 	log.Step("Exporting from live database")
@@ -307,6 +333,11 @@ func runUnattended(siteDomain string) error {
 	}
 	log.StepDone("Import complete")
 
+	// Before any WordPress code loads on stage: remove live's CDN credentials.
+	if err := sync.Neutralize(stageDB, liveWP.TablePrefix, cfg.LivePath, cfg.StagePath, liveHost, stageHost, log); err != nil {
+		return err
+	}
+
 	// Step 1b: Anonymize customer data (if enabled for this site)
 	if cfg.Anonymize {
 		log.Step("Anonymizing customer data")
@@ -318,15 +349,26 @@ func runUnattended(siteDomain string) error {
 
 	// Step 2: File sync
 	log.Step("Syncing files")
-	excludes := sync.ResolveExcludes(cfg.RsyncExcludes)
+	excludes := sync.StageObjectCacheExcludes(sync.ResolveExcludes(cfg.RsyncExcludes), cfg.StageObjectCacheOff, cfg.LivePath)
 	if err := sync.FileSync(cfg.LivePath, cfg.StagePath, excludes, log); err != nil {
 		return fmt.Errorf("file sync: %w", err)
 	}
 	log.StepDone("File sync complete")
 
+	// Before WordPress loads the new stage files: copied configs can hold
+	// live's absolute paths.
+	if err := sync.FixLivePaths(cfg.LivePath, cfg.StagePath, liveHost, stageHost, log); err != nil {
+		return err
+	}
+	if cfg.StageObjectCacheOff {
+		if err := sync.DisableStageObjectCache(cfg.StagePath, stageDB, liveWP.TablePrefix, log); err != nil {
+			return err
+		}
+	}
+
 	// Step 3: Post-processing
 	log.Step("Post-processing")
-	if err := sync.PostProcess(cfg.StagePath, liveHost, stageHost, log); err != nil {
+	if err := sync.PostProcess(cfg.LivePath, cfg.StagePath, liveHost, stageHost, log); err != nil {
 		return fmt.Errorf("post-processing: %w", err)
 	}
 	log.StepDone("Post-processing complete")
@@ -401,7 +443,7 @@ func runDryRun(siteDomain string) error {
 
 	// Plan the file sync via rsync --dry-run.
 	log.Step("Planning file sync (rsync --dry-run)")
-	excludes := sync.ResolveExcludes(cfg.RsyncExcludes)
+	excludes := sync.StageObjectCacheExcludes(sync.ResolveExcludes(cfg.RsyncExcludes), cfg.StageObjectCacheOff, cfg.LivePath)
 	rsyncPlan, rsyncErr := sync.FileSyncPlan(cfg.LivePath, cfg.StagePath, excludes)
 	if rsyncErr != nil {
 		log.Detail(fmt.Sprintf("rsync preview unavailable: %v", rsyncErr))
@@ -410,13 +452,23 @@ func runDryRun(siteDomain string) error {
 
 	liveHost := sync.SiteHost(liveDB, liveWP.TablePrefix, liveDomain)
 	stageHost := sync.SiteHost(stageDB, stageWP.TablePrefix, stageDomain)
-	ppPlan := sync.PostProcessPlan(cfg.StagePath, liveHost, stageHost)
+	ppPlan := sync.PostProcessPlan(cfg.LivePath, cfg.StagePath, liveHost, stageHost, cfg.StageObjectCacheOff)
 
 	printExportPlan(plan)
 	printImportPlan(stageTables, plan)
 	printAnonymizePlan(cfg.Anonymize)
 	printRsyncPlan(rsyncPlan, excludes, rsyncErr)
 	printPostProcessPlan(ppPlan)
+	fmt.Println()
+	fmt.Println("── Live integrations switched off on stage ───────────────────")
+	for _, name := range sync.IntegrationNames() {
+		fmt.Printf("  %s (settings cleared after the import)\n", name)
+	}
+	if err := sync.CheckNeutralize(liveDB, liveWP.TablePrefix, cfg.LivePath, cfg.StagePath, liveHost, stageHost, cfg.StageObjectCacheOff); err != nil {
+		fmt.Printf("  [check] FAILED: %v\n", err)
+	} else {
+		fmt.Println("  [check] all live settings are readable; a real sync can clear them on stage")
+	}
 
 	fmt.Println()
 	fmt.Println("No changes were made. Re-run with -u (without -n) to execute the sync.")
@@ -521,12 +573,31 @@ func printPostProcessPlan(plan *sync.PostProcessReport) {
 	if !plan.WPAvailable {
 		fmt.Println("Note: wp-cli is not installed locally; it would be downloaded at run time.")
 	}
+	fmt.Printf("Object cache: %s\n", plan.ObjectCache)
+	switch {
+	case plan.CacheOff:
+		fmt.Println("  [off]   stage object cache is switched off: no drop-in on stage")
+	case plan.ObjectCache != "no persistent object cache":
+		fmt.Println("  [check] stage and live must not share cache keys (probe key, at sync time)")
+		if plan.SharedCache != "" {
+			fmt.Printf("  WARNING: stage and live share %s. A purge in the stage admin can clear live's cache.\n", plan.SharedCache)
+			fmt.Println("           Give stage its own database, or switch the stage object cache off in the TUI.")
+		}
+	}
 	for _, c := range plan.Commands {
 		if c.Skip {
 			fmt.Printf("  [skip] %s (%s)\n", c.Label, c.SkipNote)
 			continue
 		}
 		fmt.Printf("  [run]  %s\n", c.Label)
+		if len(c.Remove) > 0 || len(c.RemoveFiles) > 0 {
+			fmt.Printf("         clear %s\n", strings.Join(append(append([]string{}, c.Remove...), c.RemoveFiles...), ", "))
+			continue
+		}
+		if strings.HasPrefix(c.Label, "Cache flush (") {
+			fmt.Println("         wp eval <" + strings.TrimSuffix(strings.SplitN(c.Label, "(", 2)[1], ")") + ">")
+			continue
+		}
 		fmt.Printf("         %s\n", strings.Join(c.Args, " "))
 	}
 }

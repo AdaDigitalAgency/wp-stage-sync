@@ -1,6 +1,7 @@
 package export
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/AdaDigitalAgency/wp-stage-sync/internal/config"
@@ -73,5 +74,38 @@ func TestFormatValue(t *testing.T) {
 		if got := formatValue(c.in); got != c.want {
 			t.Errorf("formatValue(%s) = %q, want %q", c.name, got, c.want)
 		}
+	}
+}
+
+func TestPostsFilter(t *testing.T) {
+	where, args := postsFilter([]int64{7, 9})
+	want := "post_type NOT IN ('shop_order','shop_order_refund','shop_order_placehold','shop_subscription') OR ID IN (?,?)"
+	if where != want || len(args) != 2 {
+		t.Errorf("got %q %v", where, args)
+	}
+	// No target orders: every order post goes.
+	if where, args := postsFilter(nil); strings.Contains(where, "OR") || len(args) != 0 {
+		t.Errorf("empty targets: %q %v", where, args)
+	}
+}
+
+func TestPostmetaFilter(t *testing.T) {
+	where, args := postmetaFilter("wp_posts", []int64{7})
+	want := "post_id NOT IN (SELECT ID FROM `wp_posts` WHERE post_type IN ('shop_order','shop_order_refund','shop_order_placehold','shop_subscription') AND ID NOT IN (?))"
+	if where != want || len(args) != 1 {
+		t.Errorf("got %q %v", where, args)
+	}
+	if where, _ := postmetaFilter("wp_posts", nil); strings.Contains(where, "AND ID NOT IN") {
+		t.Errorf("empty targets: %q", where)
+	}
+}
+
+func TestCustomerLookupFilter(t *testing.T) {
+	where, args := customerLookupFilter("wp_", true, []int64{1, 2}, []int64{5})
+	if !strings.Contains(where, "wp_wc_order_stats") || !strings.Contains(where, "user_id IN (?)") || len(args) != 3 {
+		t.Errorf("got %q %v", where, args)
+	}
+	if where, _ := customerLookupFilter("wp_", false, nil, nil); where != "0" {
+		t.Errorf("nothing to keep: %q", where)
 	}
 }

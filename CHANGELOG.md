@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Elementor CSS is regenerated, the LiteSpeed page cache is purged, and the WP Rocket cache folders are emptied on staging after a sync, when those plugins are installed. A failed purge is a warning.
+- The LiteSpeed Cache object cache is flushed on staging by deleting only the staging keys (Redis). With Memcached the flush is skipped with a warning.
+- Object Cache Pro is flushed on staging when staging uses its own Redis database index.
+- WP Super Cache, Powered Cache and WP Fastest Cache stage page caches are emptied after a sync.
+- After the import, staging gets live integrations switched off: Cloudflare purge in LiteSpeed Cache, WP Rocket, WP Fastest Cache and the Cloudflare plugin, WP Rocket Sucuri sync, WP Fastest Cache Varnish, and the Redis failback flush flag. A "Purge All" in the staging admin no longer purges the live Cloudflare zone.
+- More cache plugins are switched off on staging: Super Page Cache (Cloudflare keys and rule IDs), Hummingbird (Cloudflare), Swift Performance (Cloudflare and MaxCDN; Memcached mode becomes disk cache), Proxy Cache Purge (tag purges), the WP Rocket RocketCDN token, and W3 Total Cache (Cloudflare, CDN, full-site CDN and message bus, in `w3tc-config/*.php` or the database config, plus the CDN push queue).
+- W3 Total Cache on staging gets its own `instance_id`, so its object, database and page cache keys never match live's on a shared Redis or Memcached server.
+- Stage cache folders of W3 Total Cache, WP-Optimize, Breeze, Cache Enabler, Comet Cache, Swift Performance, Autoptimize, SiteGround Optimizer, Jetpack Boost, Hummingbird and Super Page Cache are emptied after a sync.
+- Object cache flush support for WP Redis (staging salt only), Hummingbird Redis (with a staging salt), W3 Total Cache, Memcached 4.x, SQLite Object Cache and Docket Cache. Memcached Redux, Memcached before 4.0 and atec Cache APCu are skipped with a warning.
+- **Stage object cache: Off.** When staging would share live's Redis database or Memcached server, the TUI confirm screen offers to switch the staging object cache off for the site. The drop-in is then not copied, and the plugin settings that would put it back are switched off on staging. Without it, the sync warns that a purge in the staging admin can clear live's cache.
+- Before the sync starts, every live setting that the staging cleanup changes is read and test-changed in memory (live is only read). If one has a format the sync cannot change, the sync stops before any change, instead of after the import. The dry run shows the same check.
+- Warnings before the sync for Cloudflare credentials in the staging `wp-config.php` and for an Nginx Helper cache folder that both sites share.
+- Powered Cache's Cloudflare settings are switched off on staging. Before, a purge in the staging admin purged the live zone.
+- The TUI done screen lists every warning of the run. Before, a warning was shown only until the next message replaced it.
+- **Stage object cache: Off** stays visible on the confirm screen once saved, so it can be set back to On. With W3 Total Cache in database config mode, Off also changes the `w3tc_config_0` options.
+- Documentation: a new `docs/` folder, published as docs pages on the website (now an Astro site), with a page per topic and a reference of every cache plugin, refusal and warning.
+- Site discovery reads LiteSpeed Enterprise's own XML config (`/usr/local/lsws/conf/httpd_config.xml`, including vhost templates) and OpenLiteSpeed's `httpd_config.conf`, and cPanel's `/etc/apache2/conf/httpd.conf`. Before, a site outside `/home`, `/var/www` and `/srv/www` on these servers was not listed.
+- The default rsync excludes also skip `boost-cache/cache`, `wphb-cache/cache`, `wphb-logs`, `wp-cloudflare-super-page-cache` and SQLite Object Cache database files.
+
+### Fixed
+
+- **Customer data reached staging on shops without HPOS.** Order filtering read only the HPOS `wc_orders` table. On a shop that stores orders in `wp_posts`, every order and its billing and shipping meta was copied, and anonymisation did not touch them. Orders are now filtered in both stores, including the copies HPOS compatibility sync keeps in `wp_posts`, and anonymisation covers order postmeta, customer notes and the HPOS address search index. `wc_customer_lookup` and `woocommerce_downloadable_product_permissions` are filtered and anonymised too.
+
+- **A sync could purge the live Cloudflare zone and flush the live object cache on LiteSpeed Cache sites.** LiteSpeed Cache answers Elementor's URL replace with a full purge, which runs with live's settings and Cloudflare credentials from the copied database. Staging WP-CLI commands now skip cache and CDN plugins.
+- **The staging cache flush could clear the live object cache.** The object cache drop-in is copied to staging, so staging used live's Redis server, and `wp cache flush` cleared the whole database. With Redis Object Cache, only keys with the staging prefix are deleted now. Without a staging prefix, or with any other drop-in, the flush is skipped with a warning.
+- The sync now refuses to start when Object Cache Pro on staging uses live's Redis database: OCP's integrity check can run `FLUSHDB` on it from a staging boot.
+- Live absolute paths in the copied `advanced-cache.php`, `object-cache.php` and `wp-cache-config.php` are replaced with the staging path. Before, a WP Super Cache clear on staging could delete live's cache folder, and staging loaded live's plugin files.
+- Live paths are also replaced in `sgo-config.php`, `autoptimize_404_handler.php`, the Swift Performance mu-plugin loader, Breeze and Docket Cache configs, and in the staging database. Before, SiteGround Optimizer on staging wrote pages into live's cache folder, Swift Performance loaded live's plugin, and Hummingbird's daily cleanup on staging deleted live's minified CSS and JS.
+- **A sync could purge live's Sucuri firewall cache with WP Rocket.** WP Rocket's Sucuri sync ran during the post-processing with live's API key.
+- The sync refuses to start when live's W3 Total Cache `db-cluster-config.php` names live's database: staging would read and write it.
+- **Promote backups failed on plugins with symlinks**, and a restore lost them. Symlinks are now stored and restored as links.
+- Promote and restore now give the copied files the owner of live's `wp-content/`. Before, live got staging's owner after a promote, and root after a restore.
+- Promote and restore flush live's object cache with the sync's scope rules (live's keys only), instead of a full `wp cache flush` that could clear other sites on a shared Redis or Memcached server.
+- The export reads live inside one read-only `REPEATABLE READ` transaction, so orders, order items and customers come from one moment on a busy shop.
+- Two runs (sync, promote or restore) on the same webroot can no longer run at once: the second one stops with the process ID of the first.
+- `q` and Ctrl+C during a sync, promote or restore ask for confirmation. `q` on the settings screen saves, as the screen says.
+- Sites whose webroot is a generic folder (`public_html`, `httpdocs`, `htdocs`, …) are named and paired after their parent folder, so two of them no longer share one saved config. Sites already saved under the old name keep it.
+- The pair list shows the real staging name (`staging.`, `dev.`, `test.`) instead of always `stage.`.
+- LiteSpeed Cache's QUIC.cloud key and site key pair are cleared on staging, so staging is not linked to live's QUIC.cloud account.
+- The `--help` text described the sync direction in reverse, and promote as unattended.
+- A failed save of the site config in the TUI is shown as a warning, and an unreadable `wp-config.php` in the pre-sync checks is reported instead of skipped silently.
+- The TUI closed only one of the two database connections it opens on the credentials screen.
+- A staging webroot inside the live webroot (or the reverse) is refused before any change. Before, the check ran after the import and the file sync.
+- The sync now stops before any change if staging and live share object cache keys, because staging would read and write live's cache. Set a separate `WP_CACHE_KEY_SALT` in the staging `wp-config.php`.
+- A staging site whose database held live's URL after an interrupted sync is repaired by the next sync. Before, the staging host was read from that database, so the search-replace went from the live host to itself.
+- A sync refuses to post-process when live and staging resolve to the same host.
+
 ## [0.7.0] - 2026-11-01
 
 ### Added

@@ -56,11 +56,17 @@ type PostProcessReport struct {
 	WPAvailable bool             // false if wp-cli is not installed locally
 	WPBase      []string         // the wp-cli invocation that would be used
 	Commands    []PlannedCommand // ordered commands with skip decisions
+	ObjectCache string           // the drop-in that stage will have
+	SharedCache string           // the backend stage would share with live, or ""
+	CacheOff    bool             // the stage object cache is switched off
 }
 
 // PostProcessPlan reports which WP-CLI commands PostProcess would run, without
 // executing them and without downloading wp-cli if it is missing.
-func PostProcessPlan(stagePath, liveHost, stageHost string) *PostProcessReport {
+//
+// The drop-in is read from live, because the file sync copies it to stage
+// before post-processing runs.
+func PostProcessPlan(livePath, stagePath, liveHost, stageHost string, cacheOff bool) *PostProcessReport {
 	wpBase, ok := wpcli.ResolveExisting()
 	display := wpBase
 	if !ok {
@@ -68,9 +74,17 @@ func PostProcessPlan(stagePath, liveHost, stageHost string) *PostProcessReport {
 		// show a representative invocation for the plan.
 		display = []string{"wp"}
 	}
-	return &PostProcessReport{
+	kind := detectObjectCache(livePath)
+	report := &PostProcessReport{
 		WPAvailable: ok,
 		WPBase:      display,
-		Commands:    postProcessCommands(display, stagePath, liveHost, stageHost),
+		ObjectCache: kind.String(),
+		SharedCache: SharedObjectCache(livePath, stagePath),
+		CacheOff:    cacheOff && kind != cacheNone,
 	}
+	if report.CacheOff {
+		kind = cacheNone
+	}
+	report.Commands = postProcessCommands(display, livePath, stagePath, liveHost, stageHost, kind)
+	return report
 }

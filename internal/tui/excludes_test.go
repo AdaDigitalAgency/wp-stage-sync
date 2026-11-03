@@ -102,3 +102,18 @@ func TestEmptyExcludeListKeysDoNotPanicOrClearConfig(t *testing.T) {
 		t.Errorf("RsyncExcludes = %#v, want nil so defaults still apply", cfg.RsyncExcludes)
 	}
 }
+
+func TestNestedDefaultExcludesListed(t *testing.T) {
+	live := liveWith(t, "cache", "boost-cache")
+	os.WriteFile(filepath.Join(live, "wp-content", ".ht.object-cache.sqlite"), nil, 0644)
+	cfg := &config.Config{LivePath: live}
+	items, checked, _ := buildExcludeList(cfg)
+	for _, want := range []string{"boost-cache/cache", ".ht.object-cache*.sqlite*"} {
+		if !slices.Contains(items, want) || !checked[want] {
+			t.Errorf("%s not listed and checked: %v", want, items)
+		}
+	}
+	if slices.Contains(items, "wphb-cache/cache") {
+		t.Error("nested default listed without its top folder")
+	}
+}

@@ -1,7 +1,6 @@
 package export
 
 import (
-	"database/sql"
 	"fmt"
 
 	"github.com/AdaDigitalAgency/wp-stage-sync/internal/config"
@@ -40,7 +39,7 @@ func (p *Plan) ExportedRows() int64 {
 
 // BuildPlan runs the shared classify() pass and, instead of dumping, counts the
 // rows each table would contribute. It issues no writes.
-func BuildPlan(liveDB *sql.DB, prefix string, cfg *config.Config, log progress.Logger) (*Plan, error) {
+func BuildPlan(liveDB querier, prefix string, cfg *config.Config, log progress.Logger) (*Plan, error) {
 	c, err := classify(liveDB, prefix, cfg, log)
 	if err != nil {
 		return nil, err
@@ -71,7 +70,7 @@ func BuildPlan(liveDB *sql.DB, prefix string, cfg *config.Config, log progress.L
 
 // countWhere counts a table's rows, optionally filtered by a WHERE clause; an
 // empty where counts the whole table.
-func countWhere(db *sql.DB, table, where string, args []interface{}) (int64, error) {
+func countWhere(db querier, table, where string, args []interface{}) (int64, error) {
 	query := fmt.Sprintf("SELECT COUNT(*) FROM `%s`", table)
 	if where != "" {
 		query += " WHERE " + where

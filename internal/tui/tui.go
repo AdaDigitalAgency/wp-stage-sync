@@ -71,6 +71,12 @@ const (
 )
 
 type model struct {
+	// sharedCache is the cache backend stage would share with live, or "".
+	sharedCache string
+	// confirmQuit is set by q or Ctrl+C during a run, until the next key.
+	confirmQuit bool
+	// warnings are the WARNING detail lines of the running operation.
+	warnings       []string
 	step           step
 	cfg            *config.Config
 	savedSites     []config.SavedSite
@@ -137,6 +143,7 @@ var (
 	promptStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("14"))
 	errorStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
 	successStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("10"))
+	warnStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("11"))
 	dimStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
 	selectedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("11"))
 	updateStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("3")).MarginTop(1)
@@ -249,6 +256,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case detailMsg:
 		m.currentDetail = msg.msg
+		// The detail line is replaced by the next message, so a warning is
+		// also kept for the done screen.
+		if strings.Contains(msg.msg, "WARNING") {
+			m.warnings = append(m.warnings, msg.msg)
+		}
 		return m, nil
 
 	case progressMsg:
@@ -272,7 +284,25 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
+		running := m.step == stepRunning || m.step == stepPromoteRunning || m.step == stepRestoreRunning
+		if m.confirmQuit {
+			m.confirmQuit = false
+			if msg.String() == "y" || msg.String() == "Y" {
+				return m, tea.Quit
+			}
+			return m, nil
+		}
 		if msg.Type == tea.KeyCtrlC || msg.String() == "q" {
+			// Quitting mid-run leaves stage (or live, for promote) half
+			// written, so it needs a second key.
+			if running {
+				m.confirmQuit = true
+				return m, nil
+			}
+			// The settings screen says "Esc or q to save and exit".
+			if msg.String() == "q" && m.step == stepSettings {
+				return m.goBack(), nil
+			}
 			return m, tea.Quit
 		}
 
@@ -442,7 +472,7 @@ func (m model) View() string {
 						marker = selectedStyle.Render("▸ ")
 					}
 					if pair.StagePath != "" {
-						label := fmt.Sprintf("%s  →  %s", pair.Domain, "stage."+pair.Domain)
+						label := fmt.Sprintf("%s  →  %s", pair.Domain, discovery.ExtractDomain(pair.StagePath))
 						if i == m.cursor {
 							b.WriteString(marker + selectedStyle.Render(label) + "\n")
 						} else {
@@ -638,6 +668,26 @@ func (m model) View() string {
 				b.WriteString(fmt.Sprintf("  Orders: %d (%s, anonymize: %s)\n", m.cfg.OrderCount, m.cfg.OrderPreference, anonText))
 			} else {
 				b.WriteString("  WooCommerce: not installed (full WordPress sync)\n")
+			}
+			if m.sharedCache != "" || m.cfg.StageObjectCacheOff {
+				cacheText := "On (shared with live)"
+				if m.sharedCache == "" {
+					cacheText = "On"
+				}
+				if m.cfg.StageObjectCacheOff {
+					cacheText = "Off"
+				}
+				b.WriteString("\n" + selectedStyle.Render("▸ Stage object cache: ") + selectedStyle.Render(cacheText) + " (Press ↑/↓ to toggle)\n")
+				note := dimStyle
+				if m.width > 10 {
+					note = note.Width(m.width - 4)
+				}
+				text := "Stage and live share " + m.sharedCache + ". A cache purge in the stage admin " +
+					"can clear live's cache. Off removes the object cache drop-in from stage. A separate database for stage is better."
+				if m.sharedCache == "" {
+					text = "Stage and live no longer share a cache backend. Set On to use the object cache on stage again."
+				}
+				b.WriteString(note.Render(text) + "\n")
 			}
 			b.WriteString("\n" + dimStyle.Render("Press Enter to start, Esc to go back"))
 
@@ -888,6 +938,10 @@ func (m model) renderProgress() string {
 			b.WriteString(dimStyle.Render(fmt.Sprintf("    [%s] %d/%d (%d%%)", bar, m.progressCurrent, m.progressTotal, pct)) + "\n")
 		}
 	}
+	if m.confirmQuit {
+		b.WriteString("\n" + warnStyle.Render("Quit now? The run stops halfway and can leave the target site half written.") + "\n")
+		b.WriteString(warnStyle.Render("Press y to quit, any other key to continue.") + "\n")
+	}
 	return b.String()
 }
 
@@ -902,6 +956,16 @@ func (m model) renderDone(label string) string {
 	} else {
 		duration := syncCompletedAt.Sub(syncStartedAt).Truncate(time.Second)
 		b.WriteString(successStyle.Render(fmt.Sprintf("✓ %s complete! (took %s)", label, duration)) + "\n")
+	}
+	if len(m.warnings) > 0 {
+		b.WriteString("\n" + warnStyle.Render(fmt.Sprintf("%d warning(s):", len(m.warnings))) + "\n")
+		note := warnStyle
+		if m.width > 10 {
+			note = note.Width(m.width - 4)
+		}
+		for _, w := range m.warnings {
+			b.WriteString(note.Render("  ! "+strings.TrimSpace(strings.Replace(w, "WARNING: ", "", 1))) + "\n")
+		}
 	}
 	b.WriteString("\n" + dimStyle.Render("Press Enter or q to exit"))
 	return b.String()
@@ -1179,6 +1243,7 @@ func (m model) updatePromoteConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		items := m.selectedPromoteItems()
 		m.step = stepPromoteRunning
 		m.completedSteps = nil
+		m.warnings = nil
 		m.currentStep = ""
 		m.currentDetail = ""
 		m.progressCurrent = 0
@@ -1222,6 +1287,7 @@ func (m model) updateRestoreConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		bk := m.restoreBackups[m.cursor]
 		m.step = stepRestoreRunning
 		m.completedSteps = nil
+		m.warnings = nil
 		m.currentStep = ""
 		m.currentDetail = ""
 		m.progressCurrent = 0
@@ -1359,6 +1425,13 @@ func (m model) updateSettings(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 func runPromote(cfg *config.Config, items []promote.SelectedItem, p *tea.Program) error {
 	log := &tuiLogger{p: p}
+	// One run per site at a time: a second sync, promote or restore would
+	// write the same files and database.
+	unlock, err := config.LockPaths(cfg.LivePath, cfg.StagePath)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 
 	// Validate
 	log.Step("Validating paths")
@@ -1399,6 +1472,13 @@ func runPromote(cfg *config.Config, items []promote.SelectedItem, p *tea.Program
 
 func runRestore(cfg *config.Config, bk *promote.BackupMeta, p *tea.Program) error {
 	log := &tuiLogger{p: p}
+	// One run per site at a time: a second sync, promote or restore would
+	// write the same files and database.
+	unlock, err := config.LockPaths(cfg.LivePath, cfg.StagePath)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 
 	domain := config.DomainFromPath(cfg.LivePath)
 	archivePath, err := promote.BackupArchivePath(domain, bk.Timestamp)
@@ -1561,11 +1641,12 @@ func (m model) readSubdirs() model {
 
 func (m model) updateCredentials(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if msg.Type == tea.KeyEnter {
-		liveDB, _, err := db.Connect(m.liveWP, m.stageWP)
+		liveDB, stageDB, err := db.Connect(m.liveWP, m.stageWP)
 		if err != nil {
 			m.err = fmt.Errorf("connecting to DB: %w", err)
 			return m, nil
 		}
+		stageDB.Close() // Connect also opens stage, to check its credentials
 		tables, err := queryTables(liveDB)
 		liveDB.Close()
 		if err != nil {
@@ -1733,13 +1814,18 @@ func buildExcludeList(cfg *config.Config) ([]string, map[string]bool, error) {
 			checked[name] = true
 		}
 	} else {
-		// Use defaults — only check items that actually exist
+		// Use defaults — only check items that actually exist. A nested
+		// default (boost-cache/cache) is listed when its top folder exists,
+		// and a file pattern when a file matches, so an edit here keeps them.
 		for _, def := range sync.DefaultExcludes {
-			for _, item := range items {
-				if item == def {
-					checked[def] = true
-					break
-				}
+			top, _, nested := strings.Cut(def, "/")
+			matches, _ := filepath.Glob(filepath.Join(wpContentPath, def))
+			switch {
+			case slices.Contains(items, def):
+				checked[def] = true
+			case strings.ContainsAny(def, "*?[") && len(matches) > 0, nested && slices.Contains(items, top):
+				items = append(items, def)
+				checked[def] = true
 			}
 		}
 	}
@@ -1753,6 +1839,7 @@ func (m model) updateExcludes(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// Nothing to select: keep the saved excludes as they are.
 		if msg.Type == tea.KeyEnter {
 			m.step = stepConfirm
+			m.sharedCache = sync.SharedObjectCache(m.cfg.LivePath, m.cfg.StagePath)
 		}
 		return m, nil
 	}
@@ -1788,6 +1875,7 @@ func (m model) updateExcludes(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// that do not exist yet. Only a real toggle saves an explicit list.
 		if m.cfg.RsyncExcludes == nil && !m.excludeTouched {
 			m.step = stepConfirm
+			m.sharedCache = sync.SharedObjectCache(m.cfg.LivePath, m.cfg.StagePath)
 			m.cursor = 0
 			return m, nil
 		}
@@ -1800,6 +1888,7 @@ func (m model) updateExcludes(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		m.cfg.RsyncExcludes = excludes
 		m.step = stepConfirm
+		m.sharedCache = sync.SharedObjectCache(m.cfg.LivePath, m.cfg.StagePath)
 		m.cursor = 0
 	}
 	return m, nil
@@ -1807,16 +1896,23 @@ func (m model) updateExcludes(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 func (m model) updateConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.Type {
+	case tea.KeyUp, tea.KeyDown:
+		if m.sharedCache != "" || m.cfg.StageObjectCacheOff {
+			m.cfg.StageObjectCacheOff = !m.cfg.StageObjectCacheOff
+		}
 	case tea.KeyEnter:
 		m.step = stepRunning
 		m.status = "Starting..."
 		m.completedSteps = nil
+		m.warnings = nil
 		m.currentStep = ""
 		m.currentDetail = ""
 		m.progressCurrent = 0
 		m.progressTotal = 0
 		m.spinnerFrame = 0
-		config.Save(m.cfg)
+		if err := config.Save(m.cfg); err != nil {
+			m.warnings = append(m.warnings, "WARNING: the site config was not saved: "+err.Error())
+		}
 
 		syncStartedAt = time.Now()
 		return m, tea.Batch(
@@ -1834,6 +1930,13 @@ func (m model) updateConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 func runSync(cfg *config.Config, liveWP, stageWP *wpconfig.WPConfig, p *tea.Program) error {
 	log := &tuiLogger{p: p}
+	// One run per site at a time: a second sync, promote or restore would
+	// write the same files and database.
+	unlock, err := config.LockPaths(cfg.LivePath, cfg.StagePath)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 
 	// Safety: ensure live ≠ stage
 	log.Step("Validating paths and databases")
@@ -1860,7 +1963,26 @@ func runSync(cfg *config.Config, liveWP, stageWP *wpconfig.WPConfig, p *tea.Prog
 
 	// Capture the real site hosts before import wipes the stage database.
 	liveHost := sync.SiteHost(liveDB, liveWP.TablePrefix, discovery.ExtractDomain(cfg.LivePath))
-	stageHost := sync.SiteHost(stageDB, stageWP.TablePrefix, discovery.ExtractDomain(cfg.StagePath))
+	stageHost, err := sync.StageHost(stageDB, stageWP.TablePrefix, cfg.StagePath, liveHost)
+	if err != nil {
+		return err
+	}
+
+	// Before anything on stage changes: refuse if stage would share live's
+	// object cache.
+	log.Step("Checking object cache isolation")
+	if err := sync.PreflightIntegrations(cfg.LivePath, cfg.StagePath, log); err != nil {
+		return err
+	}
+	// Before anything on stage changes: every live setting that the stage
+	// cleanup rewrites must be readable.
+	if err := sync.CheckNeutralize(liveDB, liveWP.TablePrefix, cfg.LivePath, cfg.StagePath, liveHost, stageHost, cfg.StageObjectCacheOff); err != nil {
+		return err
+	}
+	if err := sync.PreflightObjectCache(cfg.LivePath, cfg.StagePath, cfg.StageObjectCacheOff, log); err != nil {
+		return err
+	}
+	log.StepDone("Object cache check passed")
 
 	log.Step("Exporting from live database")
 	exp, err := export.Run(liveDB, liveWP.TablePrefix, cfg, log)
@@ -1875,6 +1997,11 @@ func runSync(cfg *config.Config, liveWP, stageWP *wpconfig.WPConfig, p *tea.Prog
 	}
 	log.StepDone("Import complete")
 
+	// Before any WordPress code loads on stage: remove live's CDN credentials.
+	if err := sync.Neutralize(stageDB, liveWP.TablePrefix, cfg.LivePath, cfg.StagePath, liveHost, stageHost, log); err != nil {
+		return err
+	}
+
 	if cfg.Anonymize {
 		log.Step("Anonymizing customer data")
 		if err := sync.Anonymize(stageDB, liveWP.TablePrefix, log); err != nil {
@@ -1884,13 +2011,24 @@ func runSync(cfg *config.Config, liveWP, stageWP *wpconfig.WPConfig, p *tea.Prog
 	}
 
 	log.Step("Syncing files")
-	if err := sync.FileSync(cfg.LivePath, cfg.StagePath, sync.ResolveExcludes(cfg.RsyncExcludes), log); err != nil {
+	if err := sync.FileSync(cfg.LivePath, cfg.StagePath, sync.StageObjectCacheExcludes(sync.ResolveExcludes(cfg.RsyncExcludes), cfg.StageObjectCacheOff, cfg.LivePath), log); err != nil {
 		return fmt.Errorf("file sync: %w", err)
 	}
 	log.StepDone("File sync complete")
 
+	// Before WordPress loads the new stage files: copied configs can hold
+	// live's absolute paths.
+	if err := sync.FixLivePaths(cfg.LivePath, cfg.StagePath, liveHost, stageHost, log); err != nil {
+		return err
+	}
+	if cfg.StageObjectCacheOff {
+		if err := sync.DisableStageObjectCache(cfg.StagePath, stageDB, liveWP.TablePrefix, log); err != nil {
+			return err
+		}
+	}
+
 	log.Step("Post-processing")
-	if err := sync.PostProcess(cfg.StagePath, liveHost, stageHost, log); err != nil {
+	if err := sync.PostProcess(cfg.LivePath, cfg.StagePath, liveHost, stageHost, log); err != nil {
 		return fmt.Errorf("post-processing: %w", err)
 	}
 	log.StepDone("Post-processing complete")

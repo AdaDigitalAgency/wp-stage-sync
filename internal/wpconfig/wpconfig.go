@@ -13,6 +13,9 @@ type WPConfig struct {
 	DBPassword  string
 	DBHost      string
 	TablePrefix string
+	// Defines holds every define() with a string literal value. A constant set
+	// from an expression, such as getenv(), is not in it.
+	Defines map[string]string
 }
 
 // The value groups match a full PHP single- or double-quoted string, allowing
@@ -73,11 +76,12 @@ func Parse(path string) (*WPConfig, error) {
 	}
 	content := string(data)
 
+	defines := make(map[string]string)
 	cfg := &WPConfig{
 		TablePrefix: "wp_", // default
+		Defines:     defines,
 	}
 
-	defines := make(map[string]string)
 	for _, match := range defineRe.FindAllStringSubmatch(content, -1) {
 		defines[match[1]] = unquote(match[2])
 	}

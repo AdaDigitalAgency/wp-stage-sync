@@ -1,6 +1,8 @@
 package promote
 
 import (
+	"github.com/AdaDigitalAgency/wp-stage-sync/internal/progress"
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -40,5 +42,34 @@ func TestUnderWPContent(t *testing.T) {
 	}
 	if underWPContent(live, "/etc/passwd") {
 		t.Error("unrelated path should be rejected")
+	}
+}
+
+func TestBackupKeepsSymlinks(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	live := t.TempDir()
+	plugin := filepath.Join(live, "wp-content", "plugins", "demo")
+	os.MkdirAll(filepath.Join(plugin, "assets"), 0755)
+	os.WriteFile(filepath.Join(plugin, "demo.php"), []byte("<?php // demo"), 0644)
+	os.Symlink("demo.php", filepath.Join(plugin, "link.php"))            // link to a file
+	os.Symlink("assets", filepath.Join(plugin, "assets-link"))           // link to a folder
+	os.Symlink("/nonexistent/target", filepath.Join(plugin, "dangling")) // broken link
+
+	archive, err := CreateBackup("demo.test", []SelectedItem{{Type: "plugin", Name: "demo", LivePath: plugin}}, progress.NopLogger{})
+	if err != nil {
+		t.Fatalf("backup with symlinks failed: %v", err)
+	}
+	out := t.TempDir()
+	if err := extractTarGz(archive, out); err != nil {
+		t.Fatal(err)
+	}
+	for name, want := range map[string]string{"link.php": "demo.php", "assets-link": "assets", "dangling": "/nonexistent/target"} {
+		got, err := os.Readlink(filepath.Join(out, "plugin", "demo", name))
+		if err != nil || got != want {
+			t.Errorf("%s: link %q (%v), want %q", name, got, err, want)
+		}
+	}
+	if data, _ := os.ReadFile(filepath.Join(out, "plugin", "demo", "demo.php")); string(data) != "<?php // demo" {
+		t.Errorf("file content = %q", data)
 	}
 }

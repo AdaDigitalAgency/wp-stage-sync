@@ -145,6 +145,11 @@ var DefaultExcludes = []string{
 	"litespeed",
 	"updraft",
 	"archive-master-db",
+	"boost-cache/cache",
+	"wphb-cache/cache",
+	"wphb-logs",
+	"wp-cloudflare-super-page-cache",
+	".ht.object-cache*.sqlite*",
 }
 
 // maxOutputLines limits how much command output CommandError keeps. A failing
@@ -154,6 +159,9 @@ const maxOutputLines = 10
 // CommandError adds the last lines of a command's output to err, because the
 // exit status alone does not say why the command failed.
 func CommandError(err error, output []byte) error {
+	if err == nil {
+		return nil
+	}
 	text := strings.TrimSpace(string(output))
 	if text == "" {
 		return err
@@ -217,6 +225,14 @@ type PlannedCommand struct {
 	Args     []string
 	Skip     bool
 	SkipNote string
+	// Optional commands only clear caches. A failure is a warning, because
+	// the stage data is already correct.
+	Optional bool
+	// Remove lists stage folders whose contents are deleted instead of
+	// running Args.
+	Remove []string
+	// RemoveFiles lists glob patterns of stage files to delete.
+	RemoveFiles []string
 }
 
 // hostFromURL returns the bare host (no scheme, no path) of a site URL such as
@@ -234,6 +250,24 @@ func hostFromURL(s string) string {
 		s = s[:i]
 	}
 	return s
+}
+
+// StageHost returns the stage host. The stage database holds live's URLs when
+// an earlier sync stopped before its search-replace, so a host equal to live's
+// is replaced by the stage directory name.
+func StageHost(db *sql.DB, prefix, stagePath, liveHost string) (string, error) {
+	dirHost := filepath.Base(strings.TrimRight(stagePath, "/"))
+	return pickStageHost(SiteHost(db, prefix, dirHost), dirHost, liveHost)
+}
+
+func pickStageHost(dbHost, dirHost, liveHost string) (string, error) {
+	if dbHost != liveHost {
+		return dbHost, nil
+	}
+	if dirHost != liveHost && dirHost != "" && dirHost != "." && dirHost != "/" {
+		return dirHost, nil
+	}
+	return "", fmt.Errorf("cannot tell the stage host from the live host (%s)", liveHost)
 }
 
 // SiteHost returns the host of the site's home/siteurl from the options table,
@@ -254,15 +288,35 @@ func SiteHost(db *sql.DB, prefix, fallback string) string {
 // postProcessCommands builds the ordered WP-CLI command list (with skip
 // decisions) shared by PostProcess and PostProcessPlan. wpBase is the resolved
 // wp-cli invocation, e.g. ["wp"] or ["php", "/path/to/wp-cli.phar"].
-func postProcessCommands(wpBase []string, stagePath, liveHost, stageHost string) []PlannedCommand {
+func postProcessCommands(wpBase []string, livePath, stagePath, liveHost, stageHost string, cache objectCache) []PlannedCommand {
+	// Every stage command skips cache and CDN plugins. Their hooks can call a
+	// full purge: LiteSpeed Cache runs purge_all() when Elementor clears its
+	// files cache, which flushes the shared object cache and can purge the
+	// live Cloudflare zone with the credentials copied from live.
 	wpArgs := func(args ...string) []string {
-		cmd := make([]string, len(wpBase), len(wpBase)+len(args))
+		cmd := make([]string, len(wpBase), len(wpBase)+len(args)+1)
 		copy(cmd, wpBase)
-		return append(cmd, args...)
+		return append(append(cmd, args...), "--skip-plugins="+strings.Join(sideEffectPlugins, ","))
+	}
+	// The LiteSpeed page purge needs LiteSpeed Cache itself loaded.
+	wpWithLiteSpeed := func(args ...string) []string {
+		var others []string
+		for _, p := range sideEffectPlugins {
+			if p != "litespeed-cache" {
+				others = append(others, p)
+			}
+		}
+		cmd := append(append([]string{}, wpBase...), args...)
+		return append(cmd, "--skip-plugins="+strings.Join(others, ","))
 	}
 
 	hasElementor := dirExists(filepath.Join(stagePath, "wp-content", "plugins", "elementor"))
 	hasJetpack := dirExists(filepath.Join(stagePath, "wp-content", "plugins", "jetpack"))
+	hasLiteSpeed := dirExists(filepath.Join(stagePath, "wp-content", "plugins", "litespeed-cache"))
+	hasRocket := dirExists(filepath.Join(stagePath, "wp-content", "plugins", "wp-rocket"))
+	hasWPFC := dirExists(filepath.Join(stagePath, "wp-content", "plugins", "wp-fastest-cache"))
+	hasSuperCache := dirExists(filepath.Join(stagePath, "wp-content", "plugins", "wp-super-cache"))
+	hasPowered := dirExists(filepath.Join(stagePath, "wp-content", "plugins", "powered-cache"))
 
 	var cmds []PlannedCommand
 
@@ -279,6 +333,18 @@ func postProcessCommands(wpBase []string, stagePath, liveHost, stageHost string)
 		})
 	}
 
+	// Plugins store absolute file paths: Hummingbird deletes the files in
+	// its minify groups' _path meta, and Swift Performance writes to its
+	// stored cache-path. With live's paths, stage deletes and writes live files.
+	live, stage := strings.TrimRight(livePath, "/")+"/", strings.TrimRight(stagePath, "/")+"/"
+	cmds = append(cmds, PlannedCommand{
+		Label: fmt.Sprintf("Search-replace: %s → %s", live, stage),
+		Args: wpArgs("search-replace", live, stage,
+			"--all-tables", "--allow-root", "--path="+stagePath),
+		Skip:     strings.HasPrefix(stage, live) || strings.HasPrefix(live, stage),
+		SkipNote: "WARNING: one site path is inside the other, so live paths in the stage database stay",
+	})
+
 	for _, p := range []string{"https://", "http://"} {
 		cmds = append(cmds, PlannedCommand{
 			Label: fmt.Sprintf("Elementor URL replace: %s%s → %s%s", p, liveHost, p, stageHost),
@@ -289,6 +355,36 @@ func postProcessCommands(wpBase []string, stagePath, liveHost, stageHost string)
 		})
 	}
 
+	cmds = append(cmds, PlannedCommand{
+		Label:    "Elementor CSS regenerate",
+		Args:     wpArgs("elementor", "flush-css", "--allow-root", "--path="+stagePath),
+		Skip:     !hasElementor,
+		SkipNote: "elementor plugin not installed",
+		Optional: true,
+	})
+
+	flushEval, flushSkip := flushPlan(cache, cachePrefix(stagePath, cache), cachePrefix(livePath, cache))
+	if cache == cacheOCP {
+		flushEval, flushSkip = ocpFlushPlan(livePath)
+	}
+	flushArgs := wpArgs("cache", "flush", "--allow-root", "--path="+stagePath)
+	flushLabel := "Cache flush"
+	if flushEval != "" {
+		flushArgs = wpArgs("eval", flushEval, "--allow-root", "--path="+stagePath)
+		flushLabel = "Cache flush (Redis, stage prefix only)"
+		if cache == cacheLiteSpeed {
+			flushLabel = "Cache flush (LiteSpeed object cache, stage prefix only)"
+		}
+		if cache == cacheOCP {
+			flushLabel = "Cache flush (Object Cache Pro, stage Redis database only)"
+		}
+		if cache == cacheWPRedis {
+			flushLabel = "Cache flush (WP Redis, stage salt only)"
+		}
+	} else if cache != cacheNone && flushSkip == "" {
+		flushLabel = "Cache flush (" + cache.String() + ")"
+	}
+
 	cmds = append(cmds,
 		PlannedCommand{
 			Label: "Jetpack safe mode",
@@ -297,24 +393,217 @@ func postProcessCommands(wpBase []string, stagePath, liveHost, stageHost string)
 			Skip:     !hasJetpack,
 			SkipNote: "jetpack plugin not installed",
 		},
+	)
+
+	switch {
+	case !config.LoadSettings().AutoCacheFlush:
+		cmds = append(cmds, PlannedCommand{Label: flushLabel, Args: flushArgs, Skip: true,
+			SkipNote: "auto cache flush disabled in settings"})
+	case flushSkip != "":
+		cmds = append(cmds, PlannedCommand{Label: flushLabel, Args: flushArgs, Skip: true,
+			SkipNote: "WARNING: " + flushSkip + ". Flush the stage cache by hand"})
+	default:
+		// The stage data is already correct, so a failed flush is a warning.
+		cmds = append(cmds, PlannedCommand{Label: flushLabel, Args: flushArgs, Optional: true})
+	}
+
+	cmds = append(cmds,
 		PlannedCommand{
-			Label:    "Cache flush",
-			Args:     wpArgs("cache", "flush", "--allow-root", "--path="+stagePath),
-			Skip:     !config.LoadSettings().AutoCacheFlush,
-			SkipNote: "auto cache flush disabled in settings",
+			// Pages only. `wp litespeed-purge all` also flushes the object
+			// cache, resets OPcache and purges Cloudflare with live's keys.
+			Label: "LiteSpeed page cache purge",
+			Args: wpWithLiteSpeed("eval", liteSpeedPagePurge,
+				"--allow-root", "--path="+stagePath),
+			Skip:     !hasLiteSpeed,
+			SkipNote: "litespeed-cache plugin not installed",
+			Optional: true,
+		},
+		PlannedCommand{
+			Label: "WP Rocket cache files",
+			Remove: []string{
+				filepath.Join(stagePath, "wp-content", "cache", "wp-rocket"),
+				filepath.Join(stagePath, "wp-content", "cache", "min"),
+				filepath.Join(stagePath, "wp-content", "cache", "busting"),
+				filepath.Join(stagePath, "wp-content", "cache", "critical-css"),
+				filepath.Join(stagePath, "wp-content", "cache", "used-css"),
+				filepath.Join(stagePath, "wp-content", "cache", "background-css"),
+				filepath.Join(stagePath, "wp-content", "cache", "fonts"),
+			},
+			Skip:     !hasRocket,
+			SkipNote: "wp-rocket plugin not installed",
+			Optional: true,
+		},
+		PlannedCommand{
+			// Paths built from the stage webroot. wp_cache_clear_cache()
+			// trusts $cache_path from the config copied from live.
+			Label:       "WP Super Cache files",
+			Remove:      cacheDirs(stagePath, filepath.Join("supercache", stageHost), "meta", "blogs"),
+			RemoveFiles: []string{filepath.Join(stagePath, "wp-content", "cache", "wp-cache-*")},
+			Skip:        !hasSuperCache,
+			SkipNote:    "wp-super-cache plugin not installed",
+			Optional:    true,
+		},
+		PlannedCommand{
+			// powered_cache_flush() fires a Cloudflare zone purge hook.
+			Label:    "Powered Cache files",
+			Remove:   cacheDirs(stagePath, filepath.Join("powered-cache", stageHost)),
+			Skip:     !hasPowered,
+			SkipNote: "powered-cache plugin not installed",
+			Optional: true,
+		},
+		PlannedCommand{
+			// Folders only: every WPFC purge function also purges Cloudflare.
+			Label:    "WP Fastest Cache files",
+			Remove:   cacheDirs(stagePath, "all", "wpfc-minified", "wpfc-mobile-cache", "wpfc-widget-cache", "tmpWpfc"),
+			Skip:     !hasWPFC,
+			SkipNote: "wp-fastest-cache plugin not installed",
+			Optional: true,
 		},
 	)
+	// Folders only, for the same reason: the purge functions of these plugins
+	// chain into Cloudflare, CDN, Varnish or object cache flushes.
+	for _, pc := range pageCaches(stagePath, stageHost) {
+		installed := false
+		for _, slug := range pc.slugs {
+			installed = installed || dirExists(filepath.Join(stagePath, "wp-content", "plugins", slug))
+		}
+		cmds = append(cmds, PlannedCommand{
+			Label: pc.label, Remove: pc.dirs, Skip: !installed,
+			SkipNote: pc.slugs[0] + " plugin not installed", Optional: true,
+		})
+	}
 	return cmds
 }
 
+// pageCache is a plugin whose stage cache folders the sync empties.
+type pageCache struct {
+	label string
+	slugs []string
+	dirs  []string
+}
+
+// pageCaches lists the cache folders of more page cache plugins. The file sync
+// excludes them (or they are keyed by host), so they hold stage's own pages
+// built from the old stage database.
+func pageCaches(stagePath, stageHost string) []pageCache {
+	content := filepath.Join(stagePath, "wp-content")
+	return []pageCache{
+		{"W3 Total Cache files", []string{"w3-total-cache"},
+			cacheDirs(stagePath, filepath.Join("page_enhanced", stageHost), "page", "minify", "db", "object")},
+		{"WP-Optimize files", []string{"wp-optimize"},
+			cacheDirs(stagePath, filepath.Join("wpo-cache", stageHost), "wpo-minify")},
+		{"Breeze files", []string{"breeze"}, cacheDirs(stagePath, "breeze", "breeze-minification", "breeze-extra")},
+		{"Cache Enabler files", []string{"cache-enabler"}, cacheDirs(stagePath, filepath.Join("cache-enabler", stageHost))},
+		{"Comet Cache files", []string{"comet-cache"}, cacheDirs(stagePath,
+			filepath.Join("comet-cache", "cache", "https", stageHost), filepath.Join("comet-cache", "cache", "http", stageHost))},
+		{"Swift Performance files", []string{"swift-performance-lite", "swift-performance"},
+			cacheDirs(stagePath, filepath.Join("swift-performance", stageHost))},
+		{"Autoptimize files", []string{"autoptimize"}, cacheDirs(stagePath, "autoptimize")},
+		{"SiteGround Optimizer files", []string{"sg-cachepress"}, cacheDirs(stagePath, "sgo-cache")},
+		{"Jetpack Boost files", []string{"jetpack-boost"}, append(cacheDirs(stagePath, "page_optimize"),
+			filepath.Join(content, "boost-cache", "cache", stageHost))},
+		{"Hummingbird files", []string{"hummingbird-performance", "wp-hummingbird"}, []string{
+			filepath.Join(content, "wphb-cache", "cache", stageHost),
+			filepath.Join(content, "wphb-cache", "cache", "mobile", stageHost)}},
+		{"Super Page Cache files", []string{"wp-cloudflare-page-cache"}, []string{
+			filepath.Join(content, "wp-cloudflare-super-page-cache", stageHost, "fallback_cache")}},
+	}
+}
+
+// sideEffectPlugins are skipped in every stage WP-CLI command. They hook
+// content and cache events to purge caches or a CDN, and the stage database
+// holds live's settings and API keys for those purges.
+var sideEffectPlugins = []string{
+	"litespeed-cache", "wp-rocket", "w3-total-cache", "wp-super-cache",
+	"wp-fastest-cache", "sg-cachepress", "breeze", "cloudflare",
+	"hummingbird-performance", "nitropack", "wp-optimize", "autoptimize",
+	"swift-performance", "swift-performance-lite", "cache-enabler", "comet-cache",
+	"powered-cache", "object-cache-pro", "wp-cloudflare-page-cache", "wp-hummingbird",
+	"nginx-helper", "varnish-http-purge", "jetpack-boost", "atec-cache-apcu",
+	"docket-cache", "sqlite-object-cache", "wp-redis", "redis-cache", "flying-press",
+}
+
+// liteSpeedPagePurge queues a purge of the stage pages and sends it to the web
+// server, without the object cache, OPcache or Cloudflare steps of purge_all().
+const liteSpeedPagePurge = `if (!class_exists('\LiteSpeed\Purge') || !method_exists('\LiteSpeed\Core', 'kick_purge_queue')) { WP_CLI::error('LiteSpeed Cache is not active or too old'); }
+\LiteSpeed\Purge::purge_all_lscache('wp-stage-sync');
+if (!\LiteSpeed\Core::kick_purge_queue()) { WP_CLI::error('Could not notify the web server to purge.'); }
+WP_CLI::success('Stage page cache purge sent to the web server.');`
+
+func cacheDirs(stagePath string, names ...string) []string {
+	dirs := make([]string, len(names))
+	for i, n := range names {
+		dirs[i] = filepath.Join(stagePath, "wp-content", "cache", n)
+	}
+	return dirs
+}
+
+// removeFiles deletes the regular files that match pattern. The pattern must
+// be inside the stage wp-content/cache folder.
+func removeFiles(stagePath, pattern string) error {
+	base := filepath.Join(stagePath, "wp-content", "cache") + string(filepath.Separator)
+	if !strings.HasPrefix(filepath.Clean(pattern), base) {
+		return fmt.Errorf("refusing to delete %s: not under %s", pattern, base)
+	}
+	matches, err := filepath.Glob(pattern)
+	if err != nil {
+		return err
+	}
+	for _, m := range matches {
+		if info, err := os.Lstat(m); err == nil && info.Mode().IsRegular() {
+			if err := os.Remove(m); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// clearRoots are the wp-content folders that hold only cache data.
+var clearRoots = []string{"cache", filepath.Join("boost-cache", "cache"), filepath.Join("wphb-cache", "cache"), "wp-cloudflare-super-page-cache"}
+
+// clearDir deletes the contents of dir and keeps dir. It refuses any path
+// outside the stage cache folders.
+func clearDir(stagePath, dir string) error {
+	// Strictly under a cache root: a root itself is not a valid target.
+	under := false
+	for _, root := range clearRoots {
+		base := filepath.Join(stagePath, "wp-content", root) + string(filepath.Separator)
+		under = under || strings.HasPrefix(filepath.Clean(dir), base)
+	}
+	if !under {
+		return fmt.Errorf("refusing to clear %s: not under a stage cache folder", dir)
+	}
+	entries, err := os.ReadDir(dir)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if err := os.RemoveAll(filepath.Join(dir, e.Name())); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // PostProcess executes Step 3: WP-CLI search-replace and cache flush.
-func PostProcess(stagePath, liveHost, stageHost string, log progress.Logger) error {
+func PostProcess(livePath, stagePath, liveHost, stageHost string, log progress.Logger) error {
 	wpBase, err := wpcli.Resolve()
 	if err != nil {
 		return fmt.Errorf("wp-cli: %w", err)
 	}
 
-	commands := postProcessCommands(wpBase, stagePath, liveHost, stageHost)
+	// A search-replace from a host to itself does nothing, and stage would
+	// keep live's URLs. PreflightObjectCache already proved cache isolation.
+	if liveHost == stageHost {
+		return fmt.Errorf("live and stage resolve to the same host (%s): refusing to post-process", liveHost)
+	}
+	cache := detectObjectCache(stagePath)
+
+	commands := postProcessCommands(wpBase, livePath, stagePath, liveHost, stageHost, cache)
 	for i, c := range commands {
 		if c.Skip {
 			log.Detail(fmt.Sprintf("Skipping: %s (%s)", c.Label, c.SkipNote))
@@ -322,9 +611,32 @@ func PostProcess(stagePath, liveHost, stageHost string, log progress.Logger) err
 		}
 		log.Detail(c.Label)
 		log.Progress(i, len(commands))
-		cmd := exec.Command(c.Args[0], c.Args[1:]...)
-		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("running %s: %w", strings.Join(c.Args, " "), err)
+		var runErr error
+		if len(c.Remove) > 0 || len(c.RemoveFiles) > 0 {
+			for _, dir := range c.Remove {
+				if runErr = clearDir(stagePath, dir); runErr != nil {
+					break
+				}
+			}
+			for _, pattern := range c.RemoveFiles {
+				if runErr != nil {
+					break
+				}
+				runErr = removeFiles(stagePath, pattern)
+			}
+		} else {
+			cmd := exec.Command(c.Args[0], c.Args[1:]...)
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				runErr = fmt.Errorf("running %s: %w", strings.Join(c.Args, " "), CommandError(err, out))
+			}
+		}
+		if runErr != nil {
+			if c.Optional {
+				log.Detail(fmt.Sprintf("WARNING: %s failed, continuing: %v", c.Label, runErr))
+				continue
+			}
+			return runErr
 		}
 	}
 	log.Progress(len(commands), len(commands))
@@ -396,7 +708,8 @@ func Anonymize(db *sql.DB, prefix string, log progress.Logger) error {
 			WHEN um.meta_key = 'billing_email' THEN CONCAT('customer_', um.user_id, '@example.com')
 			WHEN um.meta_key = 'billing_phone' THEN '555-0000'
 			WHEN um.meta_key IN ('billing_address_1', 'shipping_address_1') THEN '123 Staging Lane'
-			WHEN um.meta_key IN ('billing_address_2', 'shipping_address_2') THEN ''
+			WHEN um.meta_key IN ('billing_address_2', 'shipping_address_2', 'billing_company', 'shipping_company') THEN ''
+			WHEN um.meta_key = 'shipping_phone' THEN '555-0000'
 			WHEN um.meta_key IN ('billing_city', 'shipping_city') THEN 'Staging City'
 			WHEN um.meta_key IN ('billing_postcode', 'shipping_postcode') THEN '12345'
 			ELSE um.meta_value
@@ -409,7 +722,8 @@ func Anonymize(db *sql.DB, prefix string, log progress.Logger) error {
 			'billing_address_1', 'shipping_address_1',
 			'billing_address_2', 'shipping_address_2',
 			'billing_city', 'shipping_city',
-			'billing_postcode', 'shipping_postcode'
+			'billing_postcode', 'shipping_postcode',
+			'billing_company', 'shipping_company', 'shipping_phone'
 		)
 	`, prefix, prefix, prefix)
 
@@ -460,7 +774,80 @@ func Anonymize(db *sql.DB, prefix string, log progress.Logger) error {
 		}
 	}
 
-	// 5. Scrub order notes (comments): clear author email/IP, and replace the
+	// HPOS keeps the full address search index (names, street, e-mail,
+	// phone) in wc_orders_meta.
+	ordersMeta := prefix + "wc_orders_meta"
+	var ordersMetaCount int
+	if err := db.QueryRow("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?", ordersMeta).Scan(&ordersMetaCount); err == nil && ordersMetaCount > 0 {
+		indexQuery := fmt.Sprintf(`
+			UPDATE %swc_orders_meta SET meta_value = ''
+			WHERE meta_key IN ('_billing_address_index', '_shipping_address_index')
+		`, prefix)
+		if _, err := db.Exec(indexQuery); err != nil {
+			return fmt.Errorf("anonymizing order address index: %w", err)
+		}
+	}
+
+	// 5. Orders stored as posts (legacy order store, or HPOS sync copies):
+	// billing and shipping meta, IP and user agent, the address search index,
+	// and the customer note, which is the post excerpt.
+	log.Detail("Anonymizing order meta")
+	orderMetaQuery := fmt.Sprintf(`
+		UPDATE %spostmeta pm
+		INNER JOIN %sposts p ON p.ID = pm.post_id
+		SET pm.meta_value = CASE
+			WHEN pm.meta_key IN ('_billing_first_name', '_shipping_first_name') THEN 'Customer'
+			WHEN pm.meta_key IN ('_billing_last_name', '_shipping_last_name') THEN CONCAT('LN_', pm.post_id)
+			WHEN pm.meta_key = '_billing_email' THEN CONCAT('order_', pm.post_id, '@example.com')
+			WHEN pm.meta_key IN ('_billing_phone', '_shipping_phone') THEN '555-0000'
+			WHEN pm.meta_key IN ('_billing_address_1', '_shipping_address_1') THEN '123 Staging Lane'
+			WHEN pm.meta_key IN ('_billing_city', '_shipping_city') THEN 'Staging City'
+			WHEN pm.meta_key IN ('_billing_postcode', '_shipping_postcode') THEN '12345'
+			ELSE ''
+		END
+		WHERE p.post_type IN ('shop_order', 'shop_order_refund', 'shop_subscription')
+		AND pm.meta_key IN (
+			'_billing_first_name', '_shipping_first_name', '_billing_last_name', '_shipping_last_name',
+			'_billing_email', '_billing_phone', '_shipping_phone',
+			'_billing_address_1', '_shipping_address_1', '_billing_address_2', '_shipping_address_2',
+			'_billing_company', '_shipping_company', '_billing_city', '_shipping_city',
+			'_billing_postcode', '_shipping_postcode',
+			'_billing_address_index', '_shipping_address_index',
+			'_customer_ip_address', '_customer_user_agent'
+		)
+	`, prefix, prefix)
+	if _, err := db.Exec(orderMetaQuery); err != nil {
+		return fmt.Errorf("anonymizing order meta: %w", err)
+	}
+	orderPostQuery := fmt.Sprintf(`
+		UPDATE %sposts SET post_excerpt = ''
+		WHERE post_type IN ('shop_order', 'shop_subscription') AND post_excerpt <> ''
+	`, prefix)
+	if _, err := db.Exec(orderPostQuery); err != nil {
+		return fmt.Errorf("anonymizing order customer notes: %w", err)
+	}
+
+	// 6. Analytics customer table (wc_customer_lookup).
+	lookupTable := prefix + "wc_customer_lookup"
+	var lookupCount int
+	if err := db.QueryRow("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?", lookupTable).Scan(&lookupCount); err == nil && lookupCount > 0 {
+		log.Detail("Anonymizing analytics customers")
+		lookupQuery := fmt.Sprintf(`
+			UPDATE %swc_customer_lookup
+			SET
+				username = IF(username = '', '', CONCAT('customer_', customer_id)),
+				first_name = 'Customer',
+				last_name = CONCAT('LN_', customer_id),
+				email = CONCAT('customer_', customer_id, '@example.com'),
+				city = 'Staging City',
+				postcode = '12345'
+		`, prefix)
+		if _, err := db.Exec(lookupQuery); err != nil {
+			return fmt.Errorf("anonymizing analytics customers: %w", err)
+		}
+	}
+
+	// 7. Scrub order notes (comments): clear author email/IP, and replace the
 	// body of customer notes.
 	log.Detail("Anonymizing order notes")
 	notesQuery := fmt.Sprintf(`

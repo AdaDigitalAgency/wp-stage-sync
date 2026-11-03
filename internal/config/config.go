@@ -3,6 +3,7 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/AdaDigitalAgency/wp-stage-sync/internal/discovery"
 	"os"
 	"path/filepath"
 	"sort"
@@ -27,6 +28,10 @@ type Config struct {
 	TableModes      map[string]TableMode `json:"table_modes"`
 	// RsyncExcludes: nil means use the defaults, empty means exclude nothing.
 	RsyncExcludes []string `json:"rsync_excludes"`
+	// StageObjectCacheOff removes the persistent object cache from stage. It
+	// is offered when stage and live would share one Redis database or
+	// Memcached server.
+	StageObjectCacheOff bool `json:"stage_object_cache_off,omitempty"`
 }
 
 type Settings struct {
@@ -56,9 +61,21 @@ func sitesDir() (string, error) {
 	return filepath.Join(dir, "sites"), nil
 }
 
-// DomainFromPath extracts the domain from a webroot path.
+// DomainFromPath is the site identifier of a webroot: the saved config and
+// backups folder name. Generic webroot folders (public_html, httpdocs, …) are
+// named after their parent, so two such sites no longer share one config. A
+// site already saved under its plain folder name for this same webroot keeps
+// that name, with its config and backups.
 func DomainFromPath(webroot string) string {
-	return filepath.Base(strings.TrimRight(webroot, "/"))
+	legacy := filepath.Base(strings.TrimRight(webroot, "/"))
+	name := discovery.ExtractDomain(webroot)
+	if name == legacy {
+		return name
+	}
+	if cfg, err := Load(legacy); err == nil && filepath.Clean(cfg.LivePath) == filepath.Clean(webroot) {
+		return legacy
+	}
+	return name
 }
 
 func siteConfigPath(domain string) (string, error) {

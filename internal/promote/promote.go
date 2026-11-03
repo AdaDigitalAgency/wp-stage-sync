@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/AdaDigitalAgency/wp-stage-sync/internal/config"
@@ -214,12 +215,25 @@ func addToTar(tw *tar.Writer, srcPath, prefix string) error {
 			archiveName = prefix + "/" + rel
 		}
 
-		header, err := tar.FileInfoHeader(fi, "")
+		// A symlink is stored as a link, never followed: its target can be
+		// outside the plugin, and a link to a folder has no content to copy.
+		link := ""
+		if fi.Mode()&os.ModeSymlink != 0 {
+			if link, err = os.Readlink(path); err != nil {
+				return err
+			}
+		} else if !fi.IsDir() && !fi.Mode().IsRegular() {
+			return nil // sockets, pipes, devices: nothing to back up
+		}
+		header, err := tar.FileInfoHeader(fi, link)
 		if err != nil {
 			return err
 		}
 		header.Name = archiveName
 
+		if link != "" {
+			return tw.WriteHeader(header)
+		}
 		if fi.IsDir() {
 			header.Name += "/"
 			return tw.WriteHeader(header)
@@ -328,8 +342,14 @@ func Execute(items []SelectedItem, livePath, archivePath string, log progress.Lo
 		}
 
 		cmd := exec.Command("rsync", args...)
-		if out, err := cmd.CombinedOutput(); err != nil {
+		out, err := cmd.CombinedOutput()
+		if err != nil {
 			err = sync.CommandError(err, out)
+		} else {
+			// rsync -a keeps stage's owner; live's files must keep live's.
+			err = chownLike(livePath, dst)
+		}
+		if err != nil {
 			log.Detail(fmt.Sprintf("rsync failed for %s %s: %v", item.Type, item.Name, err))
 			if rerr := autoRestore(archivePath, livePath, log); rerr != nil {
 				return fmt.Errorf("promote failed for %s %s: %w; live may be inconsistent — %v", item.Type, item.Name, err, rerr)
@@ -343,7 +363,7 @@ func Execute(items []SelectedItem, livePath, archivePath string, log progress.Lo
 	settings := config.LoadSettings()
 	if settings.AutoCacheFlush {
 		log.Step("Flushing cache on live site")
-		if err := flushCache(livePath); err != nil {
+		if err := flushCache(livePath, log); err != nil {
 			log.Detail(fmt.Sprintf("Cache flush warning: %v", err))
 		}
 		log.StepDone("Cache flushed")
@@ -428,6 +448,10 @@ func RestoreFromBackup(archivePath string, meta *BackupMeta, livePath string, lo
 		if out, err := cmd.CombinedOutput(); err != nil {
 			return fmt.Errorf("restoring %s %s: %w", item.Type, item.Name, sync.CommandError(err, out))
 		}
+		// The extracted files belong to the user who runs the restore.
+		if err := chownLike(livePath, item.LivePath); err != nil {
+			return fmt.Errorf("restoring %s %s: %w", item.Type, item.Name, err)
+		}
 	}
 	log.Progress(len(meta.Items), len(meta.Items))
 
@@ -435,7 +459,7 @@ func RestoreFromBackup(archivePath string, meta *BackupMeta, livePath string, lo
 	settings := config.LoadSettings()
 	if settings.AutoCacheFlush {
 		log.Detail("Flushing cache after restore")
-		if err := flushCache(livePath); err != nil {
+		if err := flushCache(livePath, log); err != nil {
 			log.Detail(fmt.Sprintf("Cache flush warning: %v", err))
 		}
 	}
@@ -508,6 +532,14 @@ func extractTarGz(archivePath, destDir string) error {
 				return err
 			}
 			outFile.Close()
+		case tar.TypeSymlink:
+			// The link is recreated as it was; rsync -a copies it as a link.
+			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+				return err
+			}
+			if err := os.Symlink(header.Linkname, target); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -561,14 +593,39 @@ func BackupArchivePath(domain, timestamp string) (string, error) {
 	return filepath.Join(dir, timestamp+".tar.gz"), nil
 }
 
-func flushCache(wpPath string) error {
+// flushCache flushes live's object cache with the same scope rules as the
+// sync: only live's keys, or a skip when the drop-in's flush would clear a
+// whole shared server. Cache and CDN plugins are skipped, so no purge hook
+// runs.
+func flushCache(wpPath string, log progress.Logger) error {
 	wpBase, err := wpcli.Resolve()
 	if err != nil {
 		return err
 	}
-	args := make([]string, len(wpBase), len(wpBase)+3)
-	copy(args, wpBase)
-	args = append(args, "cache", "flush", "--allow-root", "--path="+wpPath)
-	cmd := exec.Command(args[0], args[1:]...)
-	return cmd.Run()
+	args, skip := sync.ScopedFlushArgs(wpBase, wpPath)
+	if skip != "" {
+		log.Detail("WARNING: live object cache not flushed: " + skip)
+		return nil
+	}
+	out, err := exec.Command(args[0], args[1:]...).CombinedOutput()
+	return sync.CommandError(err, out)
+}
+
+// chownLike gives path (recursively) the owner and group of live's
+// wp-content. It changes nothing when they already match.
+func chownLike(livePath, path string) error {
+	info, err := os.Stat(filepath.Join(livePath, "wp-content"))
+	if err != nil {
+		return err
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return nil
+	}
+	owner := fmt.Sprintf("%d:%d", st.Uid, st.Gid)
+	out, err := exec.Command("chown", "-R", "-h", owner, path).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("chown %s: %w", path, sync.CommandError(err, out))
+	}
+	return nil
 }
